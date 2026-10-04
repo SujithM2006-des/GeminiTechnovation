@@ -57,6 +57,7 @@ def format_video_time(seconds):
 
 
 # Which event types trigger a WhatsApp message.
+# Matched by PREFIX, so "FALL", "FALL (HIGH)", "FALL_DETECTED" all count.
 # Collisions happen often in match footage, so only falls by default.
 # Add "COLLISION" here if you want those too.
 WHATSAPP_EVENT_TYPES = {"FALL"}
@@ -65,6 +66,13 @@ WHATSAPP_EVENT_TYPES = {"FALL"}
 SEND_IDENTIFIED_UPDATE = True
 
 REQUEST_TIMEOUT = 3
+
+
+def _wants_whatsapp(event_type):
+
+    name = str(event_type or "").strip().upper()
+
+    return any(name.startswith(prefix) for prefix in WHATSAPP_EVENT_TYPES)
 
 
 # ============================================
@@ -133,7 +141,7 @@ def _write_csv(row):
 
 # ============================================
 # SAVE EVENT
-# Always saved immediately — player may be None
+# Always saved immediately - player may be None
 # (Unidentified) and filled in later with
 # update_event_player(). Returns the event id
 # from the backend, or None if it couldn't post.
@@ -195,7 +203,7 @@ def save_event(
 
     print()
     print("====================================")
-    print("       🚨 EVENT SAVED 🚨")
+    print("       EVENT SAVED")
     print("====================================")
     print("EVENT ID:", event_id)
     print("PLAYER:", display_player)
@@ -225,7 +233,7 @@ def save_event(
         injury_note,
     ])
 
-    if event_type in WHATSAPP_EVENT_TYPES:
+    if _wants_whatsapp(event_type):
 
         message = whatsapp_notifier.build_alert_message(
             player_name=player_name,
@@ -241,7 +249,11 @@ def save_event(
         message += "\nIdentified by: " + describe_identification(identified_by, id_detail, id_confidence)
         message += "\nVideo time: " + format_video_time(video_time_sec)
 
+        print("[WHATSAPP] Queued alert for:", event_type)
         whatsapp_notifier.send_message(message)
+
+    else:
+        print("[WHATSAPP] Not sent - event type '" + str(event_type) + "' is not in WHATSAPP_EVENT_TYPES")
 
     return event_id
 
@@ -280,18 +292,19 @@ def update_event_player(event_id, player_id, player_name, jersey_number=None,
     print("[API] Event", event_id, "identified as", player_name, "-",
           describe_identification(identified_by, id_detail, id_confidence))
 
-    if SEND_IDENTIFIED_UPDATE and event_type in WHATSAPP_EVENT_TYPES:
+    if SEND_IDENTIFIED_UPDATE and _wants_whatsapp(event_type):
 
         who = player_name
         if jersey_number is not None:
             who += " (#" + str(jersey_number) + ")"
 
-        text = "ℹ️ Update: the earlier Unidentified " + str(event_type).lower() + " was " + who
+        text = "\u2139\ufe0f Update: the earlier Unidentified " + str(event_type).lower() + " was " + who
         text += "\nIdentified by: " + describe_identification(identified_by, id_detail, id_confidence)
 
         if match_name:
             text += "\nMatch: " + match_name
 
+        print("[WHATSAPP] Queued identification update for event", event_id)
         whatsapp_notifier.send_message(text)
 
     return True

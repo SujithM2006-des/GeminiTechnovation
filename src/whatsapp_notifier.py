@@ -37,8 +37,33 @@ PROJECT_ROOT = os.path.dirname(_HERE)
 PROFILE_DIR = os.path.join(PROJECT_ROOT, "output", "whatsapp_profile")
 
 LOGIN_TIMEOUT = 120      # seconds to wait for QR scan / WhatsApp Web load
-CHAT_LOAD_TIMEOUT = 45   # seconds to wait for the chat to open
+CHAT_LOAD_TIMEOUT = 60   # seconds to wait for the chat box after a URL load
+INPAGE_OPEN_TIMEOUT = 12 # seconds to wait for the chat to open without reloading
+PREFILL_TIMEOUT = 15     # seconds to wait for URL-prefilled text (fallback mode)
 START_ATTEMPTS = 3       # how many times to try launching Chrome
+SEND_ATTEMPTS = 2        # attempt 1 = in-page (no reload), attempt 2 = URL fallback
+
+_BOX_SELECTOR = "footer div[contenteditable='true']"
+_TEXT_JS = "return (arguments[0].innerText || '').trim();"
+
+# opens the chat inside the already-loaded page (no reload)
+_OPEN_CHAT_JS = """
+var a = document.createElement('a');
+a.href = 'https://api.whatsapp.com/send?phone=' + arguments[0];
+a.style.display = 'none';
+document.body.appendChild(a);
+a.click();
+a.remove();
+"""
+
+# puts the WHOLE message in the box with one paste (keeps newlines and emoji)
+_PASTE_JS = """
+var box = arguments[0], text = arguments[1];
+box.focus();
+var dt = new DataTransfer();
+dt.setData('text/plain', text);
+box.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true}));
+"""
 
 
 # ============================================
@@ -50,6 +75,7 @@ START_ATTEMPTS = 3       # how many times to try launching Chrome
 _queue = queue.Queue()
 _worker = None
 _lock = threading.Lock()
+_state = {"chat_open": False}
 
 
 def _log(*parts):
@@ -127,6 +153,10 @@ def _build_options(profile_dir):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-popup-blocking")
+    # keep WhatsApp Web responsive even when the window is behind other windows
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
     return options
@@ -205,6 +235,7 @@ def _start_session():
     """Returns a logged-in driver, or None if it could not be started."""
 
     driver = None
+    _state["chat_open"] = False
 
     try:
         driver = _create_driver()
@@ -224,60 +255,180 @@ def _start_session():
         return None
 
 
-def _send(driver, text):
+# ============================================
+# SENDING
+# Attempt 1: open the chat inside the loaded page
+#            (NO reload) and paste the message.
+# Attempt 2: fallback - old URL method (reloads).
+# ============================================
+
+def _box_text(driver, box):
+    try:
+        return driver.execute_script(_TEXT_JS, box)
+    except Exception:
+        return ""
+
+
+def _find_box(driver, timeout):
 
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    _dismiss_alert(driver)
+    return WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, _BOX_SELECTOR))
+    )
+
+
+def _check_invalid_number(driver):
+
+    from selenium.webdriver.common.by import By
+
+    try:
+        page = driver.find_element(By.TAG_NAME, "body").text.lower()
+    except Exception:
+        return
+
+    if "invalid" in page and "phone" in page:
+        raise RuntimeError("WhatsApp says the phone number is invalid - check WHATSAPP_PHONE")
+
+
+def _open_inpage(driver):
+    """Returns the chat box without reloading the page."""
+
+    if _state["chat_open"]:
+        try:
+            return _find_box(driver, 5)
+        except Exception:
+            _state["chat_open"] = False
+
+    driver.execute_script(_OPEN_CHAT_JS, TARGET_PHONE)
+
+    try:
+        box = _find_box(driver, INPAGE_OPEN_TIMEOUT)
+    except Exception:
+        _check_invalid_number(driver)
+        raise RuntimeError("chat did not open in-page")
+
+    time.sleep(1)
+    return box
+
+
+def _open_by_url(driver, text):
+    """Fallback: full page load with the text prefilled. Returns the chat box."""
 
     url = "https://web.whatsapp.com/send?phone=" + TARGET_PHONE + "&text=" + quote(text)
 
     driver.get(url)
+    _dismiss_alert(driver)
+
+    try:
+        box = _find_box(driver, CHAT_LOAD_TIMEOUT)
+    except Exception:
+        _check_invalid_number(driver)
+        raise RuntimeError("chat box did not appear within " + str(CHAT_LOAD_TIMEOUT) + "s")
+
+    # wait until the prefilled text stops changing
+    last_len = -1
+    stable_since = None
+    deadline = time.time() + PREFILL_TIMEOUT
+
+    while time.time() < deadline:
+        current = _box_text(driver, box)
+
+        if current:
+            if len(current) == last_len:
+                if stable_since is None:
+                    stable_since = time.time()
+                elif time.time() - stable_since >= 1.0:
+                    break
+            else:
+                stable_since = None
+                last_len = len(current)
+
+        time.sleep(0.3)
+
+    return box
+
+
+def _send(driver, text, use_url):
+
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.support.ui import WebDriverWait
 
     _dismiss_alert(driver)
 
     try:
-        box = WebDriverWait(driver, CHAT_LOAD_TIMEOUT).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "footer div[contenteditable='true']"))
-        )
-    except Exception:
-        page = ""
+        if use_url:
+            _state["chat_open"] = False
+            box = _open_by_url(driver, text)
+
+        else:
+            box = _open_inpage(driver)
+
+            # clear any leftover draft, then paste the whole message at once
+            box.click()
+            box.send_keys(Keys.CONTROL, "a")
+            box.send_keys(Keys.DELETE)
+            time.sleep(0.3)
+
+            driver.execute_script(_PASTE_JS, box, text)
+            time.sleep(0.8)
+
+        typed = _box_text(driver, box)
+
+        _log("[WHATSAPP] Box has", len(typed), "characters; message is", len(text.strip()), "characters")
+
+        if len(typed) < max(1, int(len(text.strip()) * 0.8)):
+            raise RuntimeError("full message did not get into the chat box")
+
+        _state["chat_open"] = True
+
+        box.click()
+        box.send_keys(Keys.ENTER)
+
+        emptied = False
+
         try:
-            page = driver.find_element(By.TAG_NAME, "body").text.lower()
+            WebDriverWait(driver, 6).until(lambda d: not _box_text(d, box))
+            emptied = True
         except Exception:
             pass
 
-        if "invalid" in page and "phone" in page:
-            raise RuntimeError("WhatsApp says the phone number is invalid - check WHATSAPP_PHONE")
+        if not emptied:
+            try:
+                driver.find_element(
+                    By.CSS_SELECTOR, "button[aria-label='Send'], span[data-icon='send']"
+                ).click()
+            except Exception:
+                pass
 
-        raise
+            try:
+                WebDriverWait(driver, 8).until(lambda d: not _box_text(d, box))
+                emptied = True
+            except Exception:
+                pass
 
-    time.sleep(1.5)
+        if not emptied:
+            raise RuntimeError("message stayed in the chat box (not sent)")
 
-    try:
-        box.send_keys(Keys.ENTER)
-    except Exception:
-        # fall back to clicking the send button
-        driver.find_element(
-            By.CSS_SELECTOR, "button[aria-label='Send'], span[data-icon='send']"
-        ).click()
+        # wait for the clock icon (still sending) to go away
+        deadline = time.time() + 20
 
-    # wait until the clock icon (message still sending) is gone, then a short extra pause
-    deadline = time.time() + 15
-    time.sleep(1.5)
-
-    while time.time() < deadline:
-        try:
-            if len(driver.find_elements(By.CSS_SELECTOR, "span[data-icon='msg-time']")) == 0:
+        while time.time() < deadline:
+            try:
+                if len(driver.find_elements(By.CSS_SELECTOR, "span[data-icon='msg-time']")) == 0:
+                    break
+            except Exception:
                 break
-        except Exception:
-            break
-        time.sleep(0.5)
+            time.sleep(0.5)
 
-    time.sleep(1.5)
+        time.sleep(1)
+
+    except Exception:
+        _state["chat_open"] = False
+        raise
 
 
 def _worker_loop():
@@ -320,18 +471,19 @@ def _worker_loop():
 
         sent = False
 
-        for attempt in range(1, 3):
+        for attempt in range(1, SEND_ATTEMPTS + 1):
 
             try:
-                _send(driver, text)
+                _send(driver, text, use_url=(attempt > 1))
                 _log("[WHATSAPP] Message sent to", TARGET_PHONE)
                 sent = True
                 break
 
             except Exception as e:
                 err = str(e).strip().splitlines()[0] if str(e).strip() else repr(e)
-                _log("[WHATSAPP] Send attempt", attempt, "failed:", err)
+                _log("[WHATSAPP] Send attempt", attempt, "of", SEND_ATTEMPTS, "failed:", err)
                 _dismiss_alert(driver)
+                time.sleep(2)
 
         if not sent:
             _log("[WHATSAPP] Gave up on:", first_line)
