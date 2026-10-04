@@ -1,8 +1,5 @@
-# ---------- Secrets ----------
-.env
-*.env
-_env
-
+cd "D:\PROJECT\New folder\Technovation-main"
+@'
 # ---------- Python ----------
 __pycache__/
 *.pyc
@@ -24,18 +21,20 @@ videos/
 
 # ---------- Generated output (clips, logs, WhatsApp login!) ----------
 output/
-src/output/
 run_log*.txt
 *.log
 
 # ---------- Local databases / learned data ----------
+src/player_identifications.db
 *.db
 known_players_auto/
 known_players/
 
-# ---------- Tools / editor ----------
+# ---------- DeepFace / secrets / editor ----------
 .deepface/
+.env
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
+'@ | Set-Content -Path .gitignore -Encoding ascii
