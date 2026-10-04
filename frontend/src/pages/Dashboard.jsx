@@ -145,11 +145,18 @@ export default function Dashboard() {
   const [formSuccess, setFormSuccess] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  // Assign / correct the player on an event (medical + admin)
+  // Assign / correct the player from the events table
+  // (any role for Unidentified events, medical + admin for identified ones)
   const [assigningId, setAssigningId] = useState(null);
   const [assignChoice, setAssignChoice] = useState("");
   const [assignSaving, setAssignSaving] = useState(false);
   const [assignError, setAssignError] = useState("");
+
+  // Identify the player while watching the clip (any role, for Unidentified events)
+  const [reviewChoice, setReviewChoice] = useState("");
+  const [reviewSaving, setReviewSaving] = useState(false);
+  const [reviewError, setReviewError] = useState("");
+  const [reviewDone, setReviewDone] = useState("");
 
   const [playerId, setPlayerId] = useState("");
   const [eventType, setEventType] = useState("");
@@ -159,7 +166,13 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const role = localStorage.getItem("role");
   const username = localStorage.getItem("username");
-  const canAssign = role === "medical" || role === "admin";
+  // Medical + admin can change any event's player.
+  // Everyone (coaches too) can pick the player for an Unidentified event.
+  const canChangeAny = role === "medical" || role === "admin";
+
+  function canAssignEvent(ev) {
+    return canChangeAny || !ev.identified;
+  }
 
   function loadEvents(matchId) {
     api
@@ -185,14 +198,12 @@ export default function Dashboard() {
       .catch(() => {});
   }
 
-  // Players list (for the manual form) — once
+  // Players list, both teams (manual form + identifying players) — once
   useEffect(() => {
-    if (role === "medical" || role === "admin") {
-      api
-        .get("/players")
-        .then((res) => setPlayers(res.data))
-        .catch(() => setError("Failed to load players."));
-    }
+    api
+      .get("/players")
+      .then((res) => setPlayers(res.data))
+      .catch(() => setError("Failed to load players."));
   }, []);
 
   // Events + matches + teams — poll every 3 s, restart when the match filter changes
@@ -248,13 +259,84 @@ export default function Dashboard() {
       .finally(() => setSubmitting(false));
   }
 
-  function teamNameOf(teamId) {
-    return teams.find((t) => t.id === teamId)?.name || "";
+  function teamNameOf(player) {
+    return player.team_name || teams.find((t) => t.id === player.team_id)?.name || "";
   }
 
   const playersForSelect = [...players].sort(
     (a, b) => a.team_id - b.team_id || a.jersey_number - b.jersey_number
   );
+
+  // Players grouped by team for <optgroup> in the pickers
+  const playersByTeam = playersForSelect.reduce((groups, p) => {
+    const name = teamNameOf(p) || "Team " + p.team_id;
+    const group = groups.find((g) => g.name === name);
+    if (group) group.players.push(p);
+    else groups.push({ name, players: [p] });
+    return groups;
+  }, []);
+
+  function playerOptions() {
+    return playersByTeam.map((g) => (
+      <optgroup key={g.name} label={g.name}>
+        {g.players.map((p) => (
+          <option key={p.id} value={p.id}>
+            #{p.jersey_number} {p.name}
+          </option>
+        ))}
+      </optgroup>
+    ));
+  }
+
+  function describePlayer(playerId) {
+    const p = players.find((x) => String(x.id) === String(playerId));
+    if (!p) return "the player";
+    const team = teamNameOf(p);
+    return `${p.name} (#${p.jersey_number}${team ? ", " + team : ""})`;
+  }
+
+  // ── Clip viewer: open, and identify the player while watching ──
+  function openClip(ev) {
+    setClipEvent(ev);
+    setReviewChoice(ev.player_id ? String(ev.player_id) : "");
+    setReviewError("");
+    setReviewDone("");
+  }
+
+  function closeClip() {
+    setClipEvent(null);
+    setReviewChoice("");
+    setReviewError("");
+    setReviewDone("");
+  }
+
+  function saveReview() {
+    if (!clipEvent) return;
+
+    if (!reviewChoice) {
+      setReviewError("Pick a player first.");
+      return;
+    }
+
+    setReviewSaving(true);
+    setReviewError("");
+    setReviewDone("");
+
+    api
+      .patch(`/events/${clipEvent.id}/assign`, { player_id: Number(reviewChoice) })
+      .then((res) => {
+        const updated = res.data?.event;
+        if (updated) setClipEvent(updated);
+        setReviewDone(`Saved: ${describePlayer(reviewChoice)}`);
+        loadEvents(selectedMatch);
+        loadTeams();
+      })
+      .catch((err) => {
+        setReviewError(err?.response?.data?.detail || "Could not save the player.");
+        loadEvents(selectedMatch);   // someone else may have identified it already
+      })
+      .finally(() => setReviewSaving(false));
+  }
 
   function startAssign(ev) {
     setAssigningId(ev.id);
@@ -286,6 +368,7 @@ export default function Dashboard() {
       })
       .catch((err) => {
         setAssignError(err?.response?.data?.detail || "Could not assign player.");
+        loadEvents(selectedMatch);   // someone else may have identified it already
       })
       .finally(() => setAssignSaving(false));
   }
@@ -713,8 +796,8 @@ export default function Dashboard() {
                           </>
                         )}
 
-                        {/* Assign / correct player (medical + admin) */}
-                        {canAssign && assigningId === ev.id && (
+                        {/* Assign / correct player (any role if Unidentified, medical + admin otherwise) */}
+                        {canAssignEvent(ev) && assigningId === ev.id && (
                           <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
                             <select
                               className="form-select"
@@ -723,12 +806,7 @@ export default function Dashboard() {
                               onChange={(e) => setAssignChoice(e.target.value)}
                             >
                               <option value="">Select player…</option>
-                              {playersForSelect.map((p) => (
-                                <option key={p.id} value={p.id}>
-                                  #{p.jersey_number} {p.name}
-                                  {teamNameOf(p.team_id) ? ` (${teamNameOf(p.team_id)})` : ""}
-                                </option>
-                              ))}
+                              {playerOptions()}
                             </select>
                             <div style={{ display: "flex", gap: 6 }}>
                               <button
@@ -753,8 +831,13 @@ export default function Dashboard() {
                           </div>
                         )}
 
-                        {canAssign && assigningId !== ev.id && (
-                          <div>
+                        {canAssignEvent(ev) && assigningId !== ev.id && (
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            {!ev.identified && ev.clip_url && (
+                              <button style={smallLinkButton} onClick={() => openClip(ev)}>
+                                ▶ Review clip & identify
+                              </button>
+                            )}
                             <button style={smallLinkButton} onClick={() => startAssign(ev)}>
                               {ev.identified ? "Change player" : "Assign player"}
                             </button>
@@ -816,7 +899,7 @@ export default function Dashboard() {
                           <button
                             className="btn-secondary"
                             style={{ padding: "4px 10px", fontSize: 13 }}
-                            onClick={() => setClipEvent(ev)}
+                            onClick={() => openClip(ev)}
                           >
                             ▶ Play
                           </button>
@@ -851,7 +934,7 @@ export default function Dashboard() {
       {/* ── Clip Viewer ── */}
       {clipEvent && (
         <div
-          onClick={() => setClipEvent(null)}
+          onClick={closeClip}
           style={{
             position: "fixed",
             inset: 0,
@@ -905,7 +988,7 @@ export default function Dashboard() {
                 </div>
               </div>
               <button
-                onClick={() => setClipEvent(null)}
+                onClick={closeClip}
                 style={{
                   background: "transparent",
                   color: "#f9fafb",
@@ -926,6 +1009,63 @@ export default function Dashboard() {
               autoPlay
               style={{ width: "100%", borderRadius: 8, background: "#000" }}
             />
+
+            {/* Identify the player while watching (any role for Unidentified, medical/admin to change) */}
+            {(canAssignEvent(clipEvent) || reviewDone) && (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: "10px 12px",
+                  borderRadius: 8,
+                  background: clipEvent.identified ? "rgba(255,255,255,0.05)" : "rgba(194, 65, 12, 0.18)",
+                  border: clipEvent.identified ? "1px solid #374151" : "1px solid rgba(251, 146, 60, 0.45)",
+                }}
+              >
+                <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>
+                  {clipEvent.identified
+                    ? "Wrong player? Pick the right one"
+                    : "Who fell? Watch the clip and pick the player"}
+                </div>
+
+                {canAssignEvent(clipEvent) && (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <select
+                      className="form-select"
+                      style={{ minWidth: 260, padding: "6px 30px 6px 10px", fontSize: 13 }}
+                      value={reviewChoice}
+                      onChange={(e) => {
+                        setReviewChoice(e.target.value);
+                        setReviewError("");
+                        setReviewDone("");
+                      }}
+                    >
+                      <option value="">Select player…</option>
+                      {playerOptions()}
+                    </select>
+                    <button
+                      className="btn-primary"
+                      style={{ padding: "6px 16px", fontSize: 13, width: "auto" }}
+                      disabled={reviewSaving}
+                      onClick={saveReview}
+                    >
+                      {reviewSaving ? "Saving…" : "Save player"}
+                    </button>
+                  </div>
+                )}
+
+                {reviewError && (
+                  <div style={{ fontSize: 12, color: "#fca5a5", marginTop: 6 }}>{reviewError}</div>
+                )}
+                {reviewDone && (
+                  <div style={{ fontSize: 12, color: "#86efac", marginTop: 6 }}>✓ {reviewDone}</div>
+                )}
+                {!canChangeAny && !reviewDone && (
+                  <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6 }}>
+                    Once saved, only medical staff or admin can change it.
+                  </div>
+                )}
+              </div>
+            )}
 
             {clipEvent.injury_note && (
               <p style={{ fontSize: 13, marginTop: 10, opacity: 0.85 }}>

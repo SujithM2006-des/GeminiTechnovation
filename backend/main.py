@@ -596,9 +596,12 @@ def gemini_result(event_id: int, request: GeminiResultRequest, db: Session = Dep
 
 
 # ============================================
-# EVENTS — STAFF ASSIGN / CORRECT THE PLAYER
+# EVENTS — ASSIGN / CORRECT THE PLAYER
 # Used from the dashboard after watching the clip.
-# Works for Unidentified events and to fix a wrong AI match.
+# - Unidentified event: ANY logged-in user (admin, medical, coach)
+#   can pick the player.
+# - Already identified event: only medical staff or admin can change it.
+# The AI never overwrites a manual choice (see /ai-update and /gemini).
 # ============================================
 
 @app.patch("/events/{event_id}/assign")
@@ -609,13 +612,24 @@ def assign_player(
     db: Session = Depends(get_db)
 ):
 
-    if current_user.role not in ("medical", "admin"):
-        raise HTTPException(status_code=403, detail="Only medical staff or admin can assign players")
-
     event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
 
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
+
+    is_staff = current_user.role in ("medical", "admin")
+
+    if not is_staff:
+
+        if current_user.role != "coach":
+            raise HTTPException(status_code=403, detail="Unknown role")
+
+        if event.player_id is not None:
+            current = event.player.name if event.player is not None else "a player"
+            raise HTTPException(
+                status_code=409,
+                detail="Already identified as " + current + ". Only medical staff or admin can change it."
+            )
 
     player = db.query(Player).filter(Player.id == request.player_id).first()
 
@@ -627,7 +641,10 @@ def assign_player(
     event.player_id = player.id
     event.identified_at = func.now()
     event.identified_by = "manual"
-    event.id_detail = "assigned by " + current_user.username + " (was: " + previous + ")"
+    event.id_detail = (
+        "chosen from clip by " + current_user.username + " (" + current_user.role + ")"
+        + " - was: " + previous
+    )
     event.id_confidence = None
 
     db.commit()
@@ -711,19 +728,29 @@ def get_events(
 
 
 # ============================================
-# GET PLAYERS
+# GET PLAYERS — all players, both teams, for every role
 # ============================================
+
+# Every role gets BOTH teams: an Unidentified fall can be any player,
+# so coaches need the full roster to pick from when reviewing a clip.
 
 @app.get("/players")
 def get_players(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    if current_user.role in ("medical", "admin"):
-        players = db.query(Player).all()
-    else:
-        players = db.query(Player).filter(Player.team_id == current_user.team_id).all()
+    players = (
+        db.query(Player)
+        .order_by(Player.team_id, Player.jersey_number)
+        .all()
+    )
 
     return [
-        {"id": p.id, "name": p.name, "jersey_number": p.jersey_number, "team_id": p.team_id}
+        {
+            "id": p.id,
+            "name": p.name,
+            "jersey_number": p.jersey_number,
+            "team_id": p.team_id,
+            "team_name": p.team.name if p.team is not None else None,
+        }
         for p in players
     ]
 
