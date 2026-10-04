@@ -59,7 +59,8 @@ class MatchSession(Base):
 # away as "Unidentified" and the player is filled
 # in later on the same row once identified.
 # identified_by / id_detail / id_confidence record
-# HOW the player was recognised (jersey or face).
+# HOW the player was recognised (jersey, face, gemini or manual).
+# gemini_* columns hold Gemini's second opinion on the clip.
 # ============================================
 
 class InjuryEvent(Base):
@@ -83,6 +84,15 @@ class InjuryEvent(Base):
     id_detail = Column(String, nullable=True)
     id_confidence = Column(Float, nullable=True)
     identified_at = Column(DateTime(timezone=True), nullable=True)
+    # Gemini second opinion (see src/gemini_verifier.py)
+    gemini_verdict = Column(String, nullable=True)        # real_fall / false_alarm / unsure / error
+    gemini_confidence = Column(Float, nullable=True)
+    gemini_reason = Column(String, nullable=True)
+    gemini_description = Column(String, nullable=True)
+    gemini_jersey = Column(Integer, nullable=True)
+    gemini_team = Column(String, nullable=True)
+    gemini_jersey_confidence = Column(Float, nullable=True)
+    gemini_checked_at = Column(DateTime(timezone=True), nullable=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
     player = relationship("Player")

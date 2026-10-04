@@ -20,6 +20,7 @@ from alert_system import (
     finish as finish_notifications,
 )
 from player_identifier import PlayerIdentifier
+import gemini_verifier
 
 # START
 
@@ -119,6 +120,11 @@ MIN_PITCH_GREEN_FRACTION = 0.25  # frame must be at least this much grass to cou
 MAX_BOX_HEIGHT_FRACTION = 0.55   # a person taller than this share of the frame = close-up
 REQUIRE_LEGS_FOR_FALL = True     # knees or ankles must be visible to judge a fall
 
+# ---- Gemini second opinion (needs GEMINI_API_KEY, see gemini_verifier.py) ----
+# Each saved fall's raw frames are checked by Gemini: confident false alarms are deleted,
+# and a surer jersey read from Gemini replaces our player.
+GEMINI_CHECK = True
+
 
 def open_video_source():
     source = SOURCE_CONFIG[SOURCE_MODE]
@@ -179,6 +185,9 @@ if identifier is not None:
 
 # Opens WhatsApp Web now so you can scan the QR code while detection runs
 start_notifications()
+
+if GEMINI_CHECK:
+    gemini_verifier.start()
 
 print("Starting video loop...")
 print("Press Q to quit")
@@ -638,8 +647,10 @@ def jersey_of(player_id):
 # CLIP RECORDING
 # A rolling buffer keeps the last few seconds. When an event fires, those frames
 # plus the next few seconds are written to output\clips and attached to the event(s).
+# A second buffer keeps the same frames WITHOUT overlays, for the Gemini check.
 
 pre_buffer = deque(maxlen=max(1, int(CLIP_PRE_SECONDS * EFFECTIVE_FPS)))
+raw_pre_buffer = deque(maxlen=max(1, int(CLIP_PRE_SECONDS * EFFECTIVE_FPS)))
 POST_FRAMES = max(1, int(CLIP_POST_SECONDS * EFFECTIVE_FPS))
 active_clips = []
 clip_threads = []
@@ -656,14 +667,23 @@ def shrink_for_clip(img):
     return img.copy()
 
 
-def start_clip(event_id):
+def start_clip(event_id, box=None, frame_width=None, context=None):
     # Events from the same frame share one clip
     if len(active_clips) > 0 and active_clips[-1]["start_frame"] == frame_count:
         active_clips[-1]["event_ids"].append(event_id)
         return
+    # the fallen player's box, scaled to the (shrunk) clip size, for Gemini
+    target_box = None
+    if box is not None and frame_width:
+        scale = CLIP_WIDTH / float(frame_width) if frame_width > CLIP_WIDTH else 1.0
+        target_box = tuple(v * scale for v in box)
     active_clips.append({
         "event_ids": [event_id],
         "frames": list(pre_buffer),
+        "raw_frames": list(raw_pre_buffer),
+        "target_index": len(raw_pre_buffer),   # the current frame is appended next
+        "target_box": target_box,
+        "context": context or {},
         "remaining": POST_FRAMES,
         "start_frame": frame_count,
     })
@@ -700,12 +720,17 @@ def write_clip(clip):
     print("[CLIP] Saved", path)
     for event_id in ids:
         attach_clip(event_id, filename)
+    # Gemini second opinion on the raw frames (runs in the background)
+    if GEMINI_CHECK and clip.get("target_box") is not None and clip.get("raw_frames"):
+        gemini_verifier.submit(ids, clip["raw_frames"], clip["target_index"], clip["target_box"], clip["context"])
 
 
-def update_clips(small_frame):
+def update_clips(small_frame, raw_small_frame):
     pre_buffer.append(small_frame)
+    raw_pre_buffer.append(raw_small_frame)
     for clip in list(active_clips):
         clip["frames"].append(small_frame)
+        clip["raw_frames"].append(raw_small_frame)
         clip["remaining"] -= 1
         if clip["remaining"] <= 0:
             active_clips.remove(clip)
@@ -1005,7 +1030,16 @@ def record_event(track_id, event_type, region, movement, risk, log_name, frame=N
         # keep only recent incidents
         cutoff = frame_count - 10 * EFFECTIVE_FPS
         recent_incidents[:] = [i for i in recent_incidents if i["frame"] >= cutoff]
-    start_clip(event_id)
+    vt = int(video_time_sec)
+    start_clip(
+        event_id,
+        box=box if event_type == "FALL" else None,
+        frame_width=frame.shape[1] if frame is not None else None,
+        context={
+            "video_time": "%d:%02d:%02d" % (vt // 3600, (vt % 3600) // 60, vt % 60),
+            "player": player_name,
+        },
+    )
     event_log.append({
         "frame": frame_count,
         "time_sec": round(frame_count / EFFECTIVE_FPS, 2),
@@ -1427,8 +1461,8 @@ while True:
             annotated_frame, "NOT GAMEPLAY (close-up / crowd) - fall detection paused",
             (20, banner_y - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
-    # CLIP BUFFER (after all drawing, so clips include the labels and alerts)
-    update_clips(shrink_for_clip(annotated_frame))
+    # CLIP BUFFERS: annotated frame for the saved clip, raw frame for Gemini
+    update_clips(shrink_for_clip(annotated_frame), shrink_for_clip(frame))
     cv2.imshow("AI Injury Detection v2", annotated_frame)
     key = cv2.waitKey(max(1, int(1000 / EFFECTIVE_FPS))) & 0xFF
     if key == ord("q"):
@@ -1451,12 +1485,23 @@ for event_id in list(pending_identification.keys()):
 if identifier is not None:
     identifier.print_report()
 
+# Gemini must finish before WhatsApp closes (it may send corrections)
+if GEMINI_CHECK:
+    gemini_verifier.shutdown()
+
 finish_notifications()
 
 print()
 print("====================================")
 print(" DETECTION STOPPED")
 print("====================================")
+
+# apply Gemini's decisions to the summary
+for e in event_log:
+    if e["event_id"] in gemini_verifier.player_changes:
+        e["player"] = gemini_verifier.player_changes[e["event_id"]]
+        e["identified_by"] = "gemini"
+event_log[:] = [e for e in event_log if e["event_id"] not in gemini_verifier.deleted_event_ids]
 
 falls_saved = [e for e in event_log if e["event"].startswith("FALL")]
 falls_identified = [e for e in falls_saved if e["player"] != "Unidentified"]
@@ -1474,6 +1519,11 @@ print(" Identity found later (player followed after getting up):", stats_followe
 print(" Ignored (appeared already lying down):", stats_skipped_no_upright)
 print(" Camera cuts detected:        ", len(scene_cut_frames), "(last 200 kept)")
 print(" Non-gameplay frames skipped: ", stats_non_gameplay_frames, "(close-ups, crowd, benches)")
+if GEMINI_CHECK and gemini_verifier.is_available():
+    gs = gemini_verifier.stats
+    print(" Gemini: checked", gs["checked"], "| false alarms deleted", gs["false_alarm_deleted"],
+          "| players re-assigned", gs["reassigned"], "| newly identified", gs["identified"],
+          "| errors", gs["errors"])
 print("====================================")
 
 print()

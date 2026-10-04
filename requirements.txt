@@ -21,5 +21,8 @@ easyocr
 deepface
 tf-keras
 
+# ---------- Gemini second opinion ----------
+google-genai
+
 # ---------- WhatsApp alerts ----------
 selenium

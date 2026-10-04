@@ -1,3 +1,8 @@
+# ---------- Secrets ----------
+.env
+*.env
+_env
+
 # ---------- Python ----------
 __pycache__/
 *.pyc
@@ -19,18 +24,17 @@ videos/
 
 # ---------- Generated output (clips, logs, WhatsApp login!) ----------
 output/
+src/output/
 run_log*.txt
 *.log
 
 # ---------- Local databases / learned data ----------
-src/player_identifications.db
 *.db
 known_players_auto/
 known_players/
 
-# ---------- DeepFace / secrets / editor ----------
+# ---------- Tools / editor ----------
 .deepface/
-.env
 .vscode/
 .idea/
 Thumbs.db

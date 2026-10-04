@@ -34,8 +34,37 @@ const METHOD_LABELS = {
   jersey_history: "Jersey (before fall)",
   jersey_handoff: "Jersey (tracked)",
   face: "Face",
+  gemini: "Gemini (jersey)",
   manual: "Manual",
 };
+
+/** Gemini second-opinion badge */
+function geminiBadge(ev) {
+  const v = ev.gemini_verdict;
+  if (!v) return null;
+  const pct =
+    ev.gemini_confidence !== null && ev.gemini_confidence !== undefined
+      ? ` · ${Math.round(ev.gemini_confidence * 100)}%`
+      : "";
+  if (v === "real_fall") {
+    return { text: `Gemini ✓ real fall${pct}`, color: "var(--success-text)", bg: "var(--success-bg)" };
+  }
+  if (v === "false_alarm") {
+    return { text: `Gemini: false alarm?${pct}`, color: "var(--risk-high-text)", bg: "var(--risk-high-bg)" };
+  }
+  if (v === "unsure") {
+    return { text: `Gemini: unsure${pct}`, color: "var(--text-secondary)", bg: "rgba(100,116,139,0.15)" };
+  }
+  return { text: "Gemini: not checked", color: "var(--text-muted)", bg: "rgba(100,116,139,0.10)" };
+}
+
+/** Gemini read a different number than the stored player (and we kept ours) */
+function geminiDisagrees(ev) {
+  if (ev.gemini_jersey === null || ev.gemini_jersey === undefined) return false;
+  if (ev.identified_by === "gemini") return false;
+  if (!ev.identified) return true;
+  return ev.gemini_jersey !== ev.jersey_number;
+}
 
 function identificationText(ev) {
   if (!ev.identified) return null;
@@ -64,9 +93,18 @@ const methodBadge = (method) => ({
   borderRadius: 999,
   fontSize: 11,
   fontWeight: 600,
-  background: method === "face" ? "rgba(139, 92, 246, 0.15)" : "rgba(59, 130, 246, 0.12)",
-  color: method === "face" ? "#a78bfa" : "var(--brand-primary)",
-  border: method === "face" ? "1px solid rgba(139, 92, 246, 0.35)" : "1px solid rgba(59, 130, 246, 0.3)",
+  background:
+    method === "face" ? "rgba(139, 92, 246, 0.15)"
+    : method === "gemini" ? "rgba(16, 185, 129, 0.15)"
+    : "rgba(59, 130, 246, 0.12)",
+  color:
+    method === "face" ? "#a78bfa"
+    : method === "gemini" ? "#34d399"
+    : "var(--brand-primary)",
+  border:
+    method === "face" ? "1px solid rgba(139, 92, 246, 0.35)"
+    : method === "gemini" ? "1px solid rgba(16, 185, 129, 0.35)"
+    : "1px solid rgba(59, 130, 246, 0.3)",
 });
 
 const smallLinkButton = {
@@ -147,7 +185,7 @@ export default function Dashboard() {
       .catch(() => {});
   }
 
-  // Players list (for the manual form and Assign dropdown) — once
+  // Players list (for the manual form) — once
   useEffect(() => {
     if (role === "medical" || role === "admin") {
       api
@@ -723,8 +761,31 @@ export default function Dashboard() {
                           </div>
                         )}
                       </td>
-                      <td>
+                      <td style={{ minWidth: 120 }}>
                         <span className="event-type-chip">{ev.event_type}</span>
+                        {geminiBadge(ev) && (
+                          <div
+                            title={[ev.gemini_reason, ev.gemini_description].filter(Boolean).join(" — ")}
+                            style={{
+                              marginTop: 6,
+                              padding: "1px 8px",
+                              borderRadius: 999,
+                              fontSize: 11,
+                              fontWeight: 600,
+                              display: "inline-block",
+                              color: geminiBadge(ev).color,
+                              background: geminiBadge(ev).bg,
+                            }}
+                          >
+                            {geminiBadge(ev).text}
+                          </div>
+                        )}
+                        {geminiDisagrees(ev) && (
+                          <div style={{ fontSize: 11, color: "var(--risk-medium-text)", marginTop: 4 }}>
+                            Gemini read #{ev.gemini_jersey}
+                            {ev.gemini_team && ev.gemini_team !== "unknown" ? ` (${ev.gemini_team})` : ""}
+                          </div>
+                        )}
                       </td>
                       <td style={{ color: "var(--text-secondary)" }}>
                         {ev.region || "—"}
@@ -870,6 +931,36 @@ export default function Dashboard() {
               <p style={{ fontSize: 13, marginTop: 10, opacity: 0.85 }}>
                 {clipEvent.injury_note}
               </p>
+            )}
+
+            {clipEvent.gemini_verdict && (
+              <div
+                style={{
+                  fontSize: 13,
+                  marginTop: 8,
+                  padding: "8px 10px",
+                  borderRadius: 8,
+                  background: "rgba(255,255,255,0.05)",
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                  {geminiBadge(clipEvent)?.text}
+                  {clipEvent.gemini_jersey !== null && clipEvent.gemini_jersey !== undefined &&
+                    ` · read #${clipEvent.gemini_jersey}${
+                      clipEvent.gemini_team && clipEvent.gemini_team !== "unknown" ? ` (${clipEvent.gemini_team})` : ""
+                    }${
+                      clipEvent.gemini_jersey_confidence
+                        ? ` ${Math.round(clipEvent.gemini_jersey_confidence * 100)}%`
+                        : ""
+                    }`}
+                </div>
+                {clipEvent.gemini_description && (
+                  <div style={{ opacity: 0.85 }}>{clipEvent.gemini_description}</div>
+                )}
+                {clipEvent.gemini_reason && (
+                  <div style={{ opacity: 0.6, fontSize: 12 }}>Why: {clipEvent.gemini_reason}</div>
+                )}
+              </div>
             )}
 
             <p style={{ fontSize: 12, marginTop: 6, opacity: 0.6 }}>

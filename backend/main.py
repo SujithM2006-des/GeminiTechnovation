@@ -62,7 +62,26 @@ MIGRATIONS = [
     "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS identified_by VARCHAR",
     "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS id_detail VARCHAR",
     "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS id_confidence DOUBLE PRECISION",
+    # v4 — Gemini second opinion
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_verdict VARCHAR",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_confidence DOUBLE PRECISION",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_reason VARCHAR",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_description VARCHAR",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_jersey INTEGER",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_team VARCHAR",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_jersey_confidence DOUBLE PRECISION",
+    "ALTER TABLE injury_events ADD COLUMN IF NOT EXISTS gemini_checked_at TIMESTAMPTZ",
 ]
+
+# ============================================
+# GEMINI RULES
+# false alarm with at least this confidence -> event is deleted (clip too)
+# Gemini's jersey read replaces ours only if it is at least this sure
+# AND more confident than our own identification
+# ============================================
+
+GEMINI_DELETE_MIN_CONFIDENCE = 0.75
+GEMINI_JERSEY_MIN_CONFIDENCE = 0.60
 
 ROSTERS = {
     "Portugal": [
@@ -243,6 +262,16 @@ class AssignPlayerRequest(BaseModel):
     player_id: int
 
 
+class GeminiResultRequest(BaseModel):
+    verdict: str                                  # real_fall / false_alarm / unsure / error
+    confidence: Optional[float] = None            # 0..1, confidence in the verdict
+    reason: Optional[str] = None
+    description: Optional[str] = None
+    team: Optional[str] = None                    # "Portugal" / "Netherlands" / "unknown"
+    jersey_number: Optional[int] = None
+    jersey_confidence: Optional[float] = None     # 0..1
+
+
 class ManualEventRequest(BaseModel):
     player_id: int
     event_type: str
@@ -299,6 +328,14 @@ def event_to_dict(e: InjuryEvent):
         "id_confidence": e.id_confidence,
         "track_id": e.track_id,
         "video_time_sec": e.video_time_sec,
+        "gemini_verdict": e.gemini_verdict,
+        "gemini_confidence": e.gemini_confidence,
+        "gemini_reason": e.gemini_reason,
+        "gemini_description": e.gemini_description,
+        "gemini_jersey": e.gemini_jersey,
+        "gemini_team": e.gemini_team,
+        "gemini_jersey_confidence": e.gemini_jersey_confidence,
+        "gemini_checked_at": e.gemini_checked_at,
         "match_session_id": e.match_session_id,
         "match_name": (e.match.name if e.match is not None and e.match.name else
                        ("Match #" + str(e.match_session_id) if e.match_session_id else None)),
@@ -436,11 +473,24 @@ def ai_update_event(event_id: int, request: EventAIUpdateRequest, db: Session = 
         if player is None:
             raise HTTPException(status_code=404, detail="Player not found")
 
-        event.player_id = request.player_id
-        event.identified_at = func.now()
-        event.identified_by = request.identified_by
-        event.id_detail = request.id_detail
-        event.id_confidence = request.id_confidence
+        # never overwrite a staff decision, and only replace a Gemini answer with a surer one
+        keep_existing = (
+            event.player_id is not None
+            and (
+                event.identified_by == "manual"
+                or (
+                    event.identified_by == "gemini"
+                    and (request.id_confidence or 0) <= (event.id_confidence or 0)
+                )
+            )
+        )
+
+        if not keep_existing:
+            event.player_id = request.player_id
+            event.identified_at = func.now()
+            event.identified_by = request.identified_by
+            event.id_detail = request.id_detail
+            event.id_confidence = request.id_confidence
 
     if request.clip_path is not None:
         event.clip_path = request.clip_path
@@ -452,6 +502,97 @@ def ai_update_event(event_id: int, request: EventAIUpdateRequest, db: Session = 
     db.refresh(event)
 
     return {"message": "Event updated", "event": event_to_dict(event)}
+
+
+# ============================================
+# EVENTS — GEMINI SECOND OPINION (sent by src/gemini_verifier.py)
+# - confident false alarm  -> event and its clip are deleted
+# - confident jersey read  -> replaces our player if Gemini is surer
+# ============================================
+
+@app.patch("/events/{event_id}/gemini")
+def gemini_result(event_id: int, request: GeminiResultRequest, db: Session = Depends(get_db)):
+
+    event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
+
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    verdict = (request.verdict or "unsure").lower()
+    confidence = request.confidence if request.confidence is not None else 0.0
+
+    # 1) confident false alarm -> delete
+    if verdict == "false_alarm" and confidence >= GEMINI_DELETE_MIN_CONFIDENCE and event.identified_by != "manual":
+
+        clip_path = event.clip_path
+
+        db.delete(event)
+        db.commit()
+
+        if clip_path:
+            try:
+                os.remove(os.path.join(CLIPS_DIR, clip_path))
+            except OSError:
+                pass
+
+        return {"action": "deleted", "event_id": event_id, "reason": request.reason}
+
+    # 2) store the second opinion
+    event.gemini_verdict = verdict
+    event.gemini_confidence = request.confidence
+    event.gemini_reason = request.reason
+    event.gemini_description = request.description
+    event.gemini_team = request.team
+    event.gemini_jersey = request.jersey_number
+    event.gemini_jersey_confidence = request.jersey_confidence
+    event.gemini_checked_at = func.now()
+
+    action = "stored"
+
+    # 3) Gemini's jersey read -> player, if it is surer than ours
+    jersey_conf = request.jersey_confidence or 0.0
+
+    if (
+        request.jersey_number is not None
+        and request.team
+        and request.team.lower() != "unknown"
+        and jersey_conf >= GEMINI_JERSEY_MIN_CONFIDENCE
+        and event.identified_by != "manual"
+    ):
+
+        player = (
+            db.query(Player)
+            .join(Team, Team.id == Player.team_id)
+            .filter(Team.name.ilike(request.team.strip()), Player.jersey_number == request.jersey_number)
+            .first()
+        )
+
+        if player is not None and player.id != event.player_id:
+
+            ours = event.id_confidence or 0.0
+
+            if event.player_id is None or jersey_conf > ours:
+
+                previous = (
+                    event.player.name + " (" + str(round(ours * 100)) + "%)"
+                    if event.player is not None else "Unidentified"
+                )
+
+                event.player_id = player.id
+                event.identified_at = func.now()
+                event.identified_by = "gemini"
+                event.id_detail = (
+                    "Gemini read #" + str(request.jersey_number) + " (" + player.team.name + ")"
+                    + " - model said: " + previous
+                )
+                event.id_confidence = jersey_conf
+
+                action = "reassigned" if previous != "Unidentified" else "identified"
+
+    db.commit()
+    db.refresh(event)
+
+    return {"action": action, "event": event_to_dict(event)}
 
 
 # ============================================
