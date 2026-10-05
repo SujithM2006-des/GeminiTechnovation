@@ -83,6 +83,19 @@ MIGRATIONS = [
 GEMINI_DELETE_MIN_CONFIDENCE = 0.75
 GEMINI_JERSEY_MIN_CONFIDENCE = 0.60
 
+# ============================================
+# DUPLICATE FALLS
+# Running the detector on the same video again creates a new match session
+# and would save every fall a second time. Two AI events are the SAME fall when:
+#   - they come from DIFFERENT runs (match sessions) of the SAME video file
+#   - same event type
+#   - their times in the video are within DUPLICATE_WINDOW_SEC
+#   - same player if both are identified; otherwise same track id or same body area
+# Falls inside one run are never merged (two players can fall at the same moment).
+# ============================================
+
+DUPLICATE_WINDOW_SEC = 3.0
+
 ROSTERS = {
     "Portugal": [
         (1, "Ricardo"),
@@ -218,9 +231,148 @@ def bootstrap_data():
         db.close()
 
 
+def _video_key(match):
+    """Same video file = same key (case and slash direction ignored)."""
+    if match is None or not match.video_source:
+        return None
+    return str(match.video_source).strip().replace("\\", "/").lower()
+
+
+def _same_fall(a, b, key_a=None):
+    """True if events a and b are the same fall from two runs of the same video.
+    key_a: video key of a, when a is not saved yet (no .match loaded)."""
+
+    if a.match_session_id is None or b.match_session_id is None:
+        return False
+    if a.match_session_id == b.match_session_id:
+        return False
+    if (a.source or "ai") != "ai" or (b.source or "ai") != "ai":
+        return False
+    if a.video_time_sec is None or b.video_time_sec is None:
+        return False
+    if key_a is None:
+        key_a = _video_key(a.match)
+    if key_a is None or key_a != _video_key(b.match):
+        return False
+    if (a.event_type or "").upper() != (b.event_type or "").upper():
+        return False
+    if abs(a.video_time_sec - b.video_time_sec) > DUPLICATE_WINDOW_SEC:
+        return False
+
+    if a.player_id is not None and b.player_id is not None:
+        return a.player_id == b.player_id
+
+    same_track = a.track_id is not None and a.track_id == b.track_id
+    same_area = bool(a.region) and (a.region or "").upper() == (b.region or "").upper()
+    return same_track or same_area
+
+
+def _keep_score(e):
+    """Which copy of a duplicate to keep: staff pick > identified (by confidence) > has clip > oldest."""
+    return (
+        1 if e.identified_by == "manual" else 0,
+        1 if e.player_id is not None else 0,
+        e.id_confidence or 0.0,
+        1 if e.clip_path else 0,
+        -e.id,
+    )
+
+
+def _clip_exists(clip_path):
+    return bool(clip_path) and os.path.exists(os.path.join(CLIPS_DIR, clip_path))
+
+
+def _remove_clip_file(clip_path):
+    if not clip_path:
+        return
+    try:
+        os.remove(os.path.join(CLIPS_DIR, clip_path))
+    except OSError:
+        pass
+
+
+def remove_duplicate_events(db, dry_run=False):
+    """
+    Keeps one event per fall and deletes the extra copies (and their clip files).
+    Returns a list of {"kept": id, "removed": [ids]}.
+    """
+
+    events = (
+        db.query(InjuryEvent)
+        .filter(InjuryEvent.match_session_id.isnot(None), InjuryEvent.video_time_sec.isnot(None))
+        .all()
+    )
+    events = [e for e in events if (e.source or "ai") == "ai" and _video_key(e.match)]
+    events.sort(key=_keep_score, reverse=True)
+
+    clusters = []   # each: {"keeper": event, "members": [events], "sessions": set()}
+
+    for e in events:
+        home = None
+        for c in clusters:
+            if e.match_session_id in c["sessions"]:
+                continue
+            if _same_fall(c["keeper"], e):
+                home = c
+                break
+        if home is None:
+            clusters.append({"keeper": e, "members": [e], "sessions": {e.match_session_id}})
+        else:
+            home["members"].append(e)
+            home["sessions"].add(e.match_session_id)
+
+    report = []
+
+    for c in clusters:
+        if len(c["members"]) < 2:
+            continue
+
+        keeper = c["keeper"]
+        extras = [m for m in c["members"] if m.id != keeper.id]
+
+        report.append({"kept": keeper.id, "removed": [m.id for m in extras]})
+
+        if dry_run:
+            continue
+
+        # the kept event takes a working clip from a copy if its own is missing
+        if not _clip_exists(keeper.clip_path):
+            for m in extras:
+                if _clip_exists(m.clip_path):
+                    keeper.clip_path = m.clip_path
+                    break
+
+        for m in extras:
+            if m.clip_path and m.clip_path != keeper.clip_path:
+                _remove_clip_file(m.clip_path)
+            db.delete(m)
+
+    if not dry_run and report:
+        db.commit()
+
+    return report
+
+
+def _cleanup_duplicates_on_startup():
+    db = SessionLocal()
+    try:
+        report = remove_duplicate_events(db)
+        removed = sum(len(r["removed"]) for r in report)
+        if removed:
+            print("[DUPLICATES] Removed", removed, "duplicate event(s):", report)
+        else:
+            print("[DUPLICATES] No duplicate events found")
+    except Exception as e:
+        db.rollback()
+        print("[DUPLICATES] Cleanup skipped:", e)
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def on_startup():
     bootstrap_data()
+    _cleanup_duplicates_on_startup()
 
 
 # ============================================
@@ -447,11 +599,66 @@ def create_event(request: EventCreateRequest, db: Session = Depends(get_db)):
         event.id_detail = request.id_detail
         event.id_confidence = request.id_confidence
 
+    # Same fall already saved by an earlier run of this video? Reuse that event.
+    existing = _find_duplicate(db, event)
+
+    if existing is not None:
+
+        # fill in the player if the earlier copy never got one (never overrides staff)
+        if existing.player_id is None and event.player_id is not None:
+            existing.player_id = event.player_id
+            existing.identified_at = func.now()
+            existing.identified_by = event.identified_by
+            existing.id_detail = event.id_detail
+            existing.id_confidence = event.id_confidence
+            db.commit()
+
+        return {
+            "message": "Duplicate of an event from an earlier run of this video",
+            "event_id": existing.id,
+            "duplicate": True,
+        }
+
     db.add(event)
     db.commit()
     db.refresh(event)
 
-    return {"message": "Event recorded", "event_id": event.id}
+    return {"message": "Event recorded", "event_id": event.id, "duplicate": False}
+
+
+def _find_duplicate(db, new_event):
+    """Closest matching event from an earlier run of the same video, or None."""
+
+    if new_event.match_session_id is None or new_event.video_time_sec is None:
+        return None
+    if (new_event.source or "ai") != "ai":
+        return None
+
+    match = db.query(MatchSession).filter(MatchSession.id == new_event.match_session_id).first()
+    key = _video_key(match)
+
+    if key is None:
+        return None
+
+    candidates = (
+        db.query(InjuryEvent)
+        .join(MatchSession, InjuryEvent.match_session_id == MatchSession.id)
+        .filter(
+            InjuryEvent.match_session_id != new_event.match_session_id,
+            InjuryEvent.video_time_sec.isnot(None),
+            InjuryEvent.video_time_sec >= new_event.video_time_sec - DUPLICATE_WINDOW_SEC,
+            InjuryEvent.video_time_sec <= new_event.video_time_sec + DUPLICATE_WINDOW_SEC,
+        )
+        .all()
+    )
+
+    matches = [c for c in candidates if _same_fall(new_event, c, key_a=key)]
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda c: abs(c.video_time_sec - new_event.video_time_sec))
+    return matches[0]
 
 
 # ============================================
@@ -493,7 +700,12 @@ def ai_update_event(event_id: int, request: EventAIUpdateRequest, db: Session = 
             event.id_confidence = request.id_confidence
 
     if request.clip_path is not None:
-        event.clip_path = request.clip_path
+        # A re-run of the same video sends a second clip for the same fall:
+        # keep the clip that already works and delete the new copy.
+        if event.clip_path and event.clip_path != request.clip_path and _clip_exists(event.clip_path):
+            _remove_clip_file(request.clip_path)
+        else:
+            event.clip_path = request.clip_path
 
     if request.injury_note is not None:
         event.injury_note = request.injury_note
@@ -842,6 +1054,31 @@ def resolve_event(event_id: int, current_user: User = Depends(get_current_user),
     db.commit()
 
     return {"message": "Event marked as resolved"}
+
+
+# ============================================
+# ADMIN — REMOVE DUPLICATE EVENTS
+# Also runs automatically every time the backend starts.
+# ?dry_run=true only lists what would be removed.
+# ============================================
+
+@app.post("/admin/events/remove-duplicates")
+def admin_remove_duplicates(
+    dry_run: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can perform this action")
+
+    report = remove_duplicate_events(db, dry_run=dry_run)
+
+    return {
+        "dry_run": dry_run,
+        "groups": report,
+        "removed_events": sum(len(r["removed"]) for r in report),
+    }
 
 
 # ============================================

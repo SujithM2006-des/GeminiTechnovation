@@ -67,6 +67,10 @@ SEND_IDENTIFIED_UPDATE = True
 
 REQUEST_TIMEOUT = 3
 
+# Events the backend reported as duplicates (same fall already saved by an
+# earlier run of the same video). No WhatsApp messages are sent for these.
+_duplicate_event_ids = set()
+
 
 def _wants_whatsapp(event_type):
 
@@ -190,12 +194,17 @@ def save_event(
     }
 
     event_id = None
+    is_duplicate = False
 
     try:
         response = requests.post(API_BASE + "/events", json=payload, timeout=REQUEST_TIMEOUT)
 
         if response.status_code == 200:
-            event_id = response.json()["event_id"]
+            data = response.json()
+            event_id = data["event_id"]
+            is_duplicate = bool(data.get("duplicate"))
+            if is_duplicate and event_id is not None:
+                _duplicate_event_ids.add(event_id)
         else:
             print("[API] Failed to post event:", response.status_code, response.text)
 
@@ -206,7 +215,7 @@ def save_event(
 
     print()
     print("====================================")
-    print("       EVENT SAVED")
+    print("       EVENT SAVED" if not is_duplicate else "  DUPLICATE (already saved by an earlier run)")
     print("====================================")
     print("EVENT ID:", event_id)
     print("PLAYER:", display_player)
@@ -240,7 +249,10 @@ def save_event(
         injury_note,
     ])
 
-    if _wants_whatsapp(event_type):
+    if is_duplicate:
+        print("[WHATSAPP] Not sent - this fall was already alerted when the video was run before (event", event_id, ")")
+
+    elif _wants_whatsapp(event_type):
 
         message = whatsapp_notifier.build_alert_message(
             player_name=player_name,
@@ -309,7 +321,10 @@ def update_event_player(event_id, player_id, player_name, jersey_number=None,
     print("[API] Event", event_id, "identified as", player_name, "-",
           describe_identification(identified_by, id_detail, id_confidence))
 
-    if SEND_IDENTIFIED_UPDATE and _wants_whatsapp(event_type):
+    if event_id in _duplicate_event_ids:
+        print("[WHATSAPP] Not sent - identification update for a duplicate event", event_id)
+
+    elif SEND_IDENTIFIED_UPDATE and _wants_whatsapp(event_type):
 
         who = player_name
         if jersey_number is not None:
