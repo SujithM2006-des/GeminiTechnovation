@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import api from "../api/client";
 import "../App.css";
@@ -129,6 +129,262 @@ const unidentifiedBadge = {
   border: "1px solid #fed7aa",
 };
 
+// ── Recommended safety measures ────────────────────────────────────────────
+// Same text as SAFETY_MEASURES in src/injury_notes.py (used in WhatsApp alerts).
+// Chosen from the body area + risk. AI suggestion only: medical staff decide.
+
+const SAFETY_DISCLAIMER = "AI suggestion based on body area and risk, medical staff must confirm";
+
+const SAFETY_MEASURES = {
+  HIGH: {
+    HEAD: [
+      "Remove the player from play immediately",
+      "Do not move the player if unconscious or confused",
+      "Call emergency medical services",
+      "CT scan of the head",
+    ],
+    NECK: [
+      "Do not move the player",
+      "Keep the head and neck still (manual in-line support)",
+      "Spinal board and emergency transfer",
+      "CT or MRI of the cervical spine",
+    ],
+    TORSO: [
+      "Check breathing and abdominal pain",
+      "Emergency transfer if breathing is difficult",
+      "Chest X-ray",
+      "Abdominal ultrasound or CT for internal injury",
+    ],
+    ARM: [
+      "Splint the arm in the position found",
+      "Check pulse and colour below the injury",
+      "X-ray",
+      "Orthopaedic referral",
+    ],
+    LEG: [
+      "Do not let the player stand",
+      "Splint the leg and use a stretcher",
+      "X-ray",
+      "MRI for ligament (ACL) damage",
+      "Orthopaedic referral",
+    ],
+    UNKNOWN: [
+      "Remove the player from play",
+      "Full medical assessment on the pitch",
+      "Emergency transfer if any serious sign",
+      "Imaging (X-ray / CT) as advised by the doctor",
+    ],
+  },
+  MEDIUM: {
+    HEAD: [
+      "Remove the player from play",
+      "Sideline concussion check (SCAT)",
+      "No return the same day if any symptom",
+      "Doctor review",
+    ],
+    NECK: [
+      "Remove the player from play",
+      "Check for numbness or tingling in the arms",
+      "X-ray if pain persists",
+    ],
+    TORSO: [
+      "Check rib pain and breathing",
+      "Chest X-ray if breathing hurts",
+    ],
+    ARM: [
+      "Support the arm in a sling",
+      "X-ray if swelling or deformity",
+    ],
+    LEG: [
+      "No weight-bearing",
+      "Ice and compression",
+      "X-ray",
+      "Physio review",
+    ],
+    UNKNOWN: [
+      "Remove the player from play",
+      "Medical check before returning",
+    ],
+  },
+  LOW: {
+    HEAD: [
+      "Check for concussion signs (confusion, headache, dizziness)",
+      "Monitor for 24 hours",
+    ],
+    NECK: [
+      "Check neck movement",
+      "Stop play if any pain",
+    ],
+    TORSO: [
+      "Ice",
+      "Watch breathing",
+    ],
+    ARM: [
+      "Rest, ice, compression, elevation (RICE)",
+      "Check grip strength",
+    ],
+    LEG: [
+      "Rest, ice, compression, elevation (RICE)",
+      "Must bear weight before returning to play",
+    ],
+    UNKNOWN: [
+      "Check the player before they continue",
+      "Monitor for any pain",
+    ],
+  },
+};
+
+const COLLISION_MEASURES = ["Check both players", "Follow the safety measures for any player who stays down"];
+
+/** HEAD / NECK / LEG / ARM / TORSO / UNKNOWN, same rules as injury_notes._area */
+function bodyArea(region) {
+  if (!region) return "UNKNOWN";
+  const r = String(region).toUpperCase();
+  if (r.includes("HEAD")) return "HEAD";
+  if (r.includes("NECK")) return "NECK";
+  if (r.includes("LEG")) return "LEG";
+  if (r.includes("ARM")) return "ARM";
+  if (r.includes("TORSO")) return "TORSO";
+  return "UNKNOWN";
+}
+
+function safetyMeasures(ev) {
+  if (String(ev.event_type || "").toUpperCase().startsWith("COLLISION")) return COLLISION_MEASURES;
+  let risk = String(ev.risk || "LOW").toUpperCase();
+  if (!SAFETY_MEASURES[risk]) risk = "LOW";
+  return SAFETY_MEASURES[risk][bodyArea(ev.region)];
+}
+
+const SAFETY_COLORS = {
+  HIGH: { bg: "var(--risk-high-bg)", border: "var(--risk-high-border)", text: "var(--risk-high-text)" },
+  MEDIUM: { bg: "var(--risk-medium-bg)", border: "var(--risk-medium-border)", text: "var(--risk-medium-text)" },
+  LOW: { bg: "var(--risk-low-bg)", border: "var(--risk-low-border)", text: "var(--risk-low-text)" },
+};
+
+/** Box listing the recommended steps for one event */
+function SafetyMeasures({ ev }) {
+  const steps = safetyMeasures(ev);
+  if (!steps || steps.length === 0) return null;
+  const c = SAFETY_COLORS[String(ev.risk || "").toUpperCase()] || SAFETY_COLORS.LOW;
+
+  return (
+    <div
+      style={{
+        fontSize: 13,
+        padding: "8px 10px",
+        borderRadius: "var(--radius-sm)",
+        background: c.bg,
+        border: "1px solid " + c.border,
+        color: "var(--text-primary)",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: "uppercase",
+          letterSpacing: "0.06em",
+          color: c.text,
+          marginBottom: 4,
+        }}
+      >
+        Recommended safety measures
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 18 }}>
+        {steps.map((step) => (
+          <li key={step} style={{ marginBottom: 2 }}>
+            {step}
+          </li>
+        ))}
+      </ul>
+      <div style={{ fontSize: 11, opacity: 0.65, marginTop: 4 }}>{SAFETY_DISCLAIMER}</div>
+    </div>
+  );
+}
+
+// ── Player history dropdown ────────────────────────────────────────────────
+// Opens under a player's row: every fall for that player with the possible
+// injury, body area, risk and the video clip.
+
+function PlayerHistory({ playerId, playerName, events }) {
+  const list = events
+    .filter((e) => e.player_id === playerId)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  const high = list.filter((e) => e.risk === "HIGH").length;
+
+  if (list.length === 0) {
+    return (
+      <div className="player-history">
+        <div className="player-history-empty">No injury events recorded for {playerName}.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="player-history">
+      <div className="player-history-summary">
+        <strong>{playerName}</strong>
+        <span>
+          {list.length} {list.length === 1 ? "event" : "events"}
+          {high > 0 && <span className="player-history-high"> · {high} high risk</span>}
+          {" · latest "}
+          {new Date(list[0].timestamp).toLocaleString()}
+        </span>
+      </div>
+
+      <div className="player-history-grid">
+        {list.map((ev) => (
+          <div key={ev.id} className="player-history-card">
+            <div className="player-history-card-head">
+              <span className="event-type-chip">{ev.event_type}</span>
+              {ev.risk && <span className={`risk-badge ${ev.risk}`}>{ev.risk}</span>}
+              <span className="player-history-area">{ev.region || "Body area not recorded"}</span>
+            </div>
+
+            <div className="player-history-injury">
+              <div className="player-history-label">Possible injury</div>
+              <div>{ev.injury_note || ev.note || "No injury note"}</div>
+            </div>
+
+            <SafetyMeasures ev={ev} />
+
+            {ev.clip_url ? (
+              <video
+                className="player-history-video"
+                src={API_BASE + ev.clip_url}
+                controls
+                preload="metadata"
+              />
+            ) : (
+              <div className="player-history-noclip">
+                {ev.source === "manual" ? "Logged by staff — no video" : "No clip saved for this event"}
+              </div>
+            )}
+
+            <div className="player-history-meta">
+              <span>{ev.match_name || "No match"}</span>
+              {formatVideoTime(ev.video_time_sec) && <span>at {formatVideoTime(ev.video_time_sec)} in video</span>}
+              <span>{new Date(ev.timestamp).toLocaleString()}</span>
+              {identificationText(ev) && (
+                <span title={ev.id_detail || ""}>Identified by: {identificationText(ev)}</span>
+              )}
+              {ev.gemini_verdict && geminiBadge(ev) && <span>{geminiBadge(ev).text}</span>}
+              <span>{ev.resolved ? "✓ Resolved" : "Pending"}</span>
+            </div>
+
+            {ev.clip_url && (
+              <a className="player-history-download" href={API_BASE + ev.clip_url} download>
+                Download clip
+              </a>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
@@ -137,6 +393,12 @@ export default function Dashboard() {
   const [matches, setMatches] = useState([]);
   const [selectedMatch, setSelectedMatch] = useState("");
   const [clipEvent, setClipEvent] = useState(null);
+
+  // Player dropdowns: all events (every match) for player histories,
+  // which player is open in Team Details, which event row is open in Injury Events
+  const [allEvents, setAllEvents] = useState([]);
+  const [openTeamPlayer, setOpenTeamPlayer] = useState(null);
+  const [openEventRow, setOpenEventRow] = useState(null);
   const [teams, setTeams] = useState([]);
   const [activeTeam, setActiveTeam] = useState(0);
 
@@ -184,6 +446,13 @@ export default function Dashboard() {
       .catch(() => setError("Failed to load events. Try logging in again."));
   }
 
+  function loadAllEvents() {
+    api
+      .get("/events")
+      .then((res) => setAllEvents(res.data))
+      .catch(() => {});
+  }
+
   function loadTeams() {
     api
       .get("/teams")
@@ -210,6 +479,7 @@ export default function Dashboard() {
   useEffect(() => {
     function refresh() {
       loadEvents(selectedMatch);
+      loadAllEvents();
       loadMatches();
       loadTeams();
     }
@@ -538,19 +808,37 @@ export default function Dashboard() {
                     </thead>
                     <tbody>
                       {team.players.map((p) => (
-                        <tr key={p.id}>
-                          <td>{p.jersey_number}</td>
-                          <td style={{ fontWeight: 500 }}>{p.name}</td>
-                          <td>{p.injury_events}</td>
-                          <td
-                            style={{
-                              color: p.high_risk_events > 0 ? "var(--risk-high-text)" : "var(--text-muted)",
-                              fontWeight: p.high_risk_events > 0 ? 700 : 400,
-                            }}
-                          >
-                            {p.high_risk_events}
-                          </td>
-                        </tr>
+                        <Fragment key={p.id}>
+                          <tr className={openTeamPlayer === p.id ? "row-open" : ""}>
+                            <td>{p.jersey_number}</td>
+                            <td>
+                              <button
+                                className="player-toggle"
+                                aria-expanded={openTeamPlayer === p.id}
+                                onClick={() => setOpenTeamPlayer(openTeamPlayer === p.id ? null : p.id)}
+                              >
+                                <span className="player-toggle-caret">{openTeamPlayer === p.id ? "▾" : "▸"}</span>
+                                {p.name}
+                              </button>
+                            </td>
+                            <td>{p.injury_events}</td>
+                            <td
+                              style={{
+                                color: p.high_risk_events > 0 ? "var(--risk-high-text)" : "var(--text-muted)",
+                                fontWeight: p.high_risk_events > 0 ? 700 : 400,
+                              }}
+                            >
+                              {p.high_risk_events}
+                            </td>
+                          </tr>
+                          {openTeamPlayer === p.id && (
+                            <tr className="history-row">
+                              <td colSpan={4}>
+                                <PlayerHistory playerId={p.id} playerName={p.name} events={allEvents} />
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
                       ))}
                     </tbody>
                   </table>
@@ -761,11 +1049,20 @@ export default function Dashboard() {
                 </thead>
                 <tbody>
                   {events.map((ev) => (
-                    <tr key={ev.id}>
+                    <Fragment key={ev.id}>
+                    <tr className={openEventRow === ev.id ? "row-open" : ""}>
                       <td style={{ minWidth: 170 }}>
                         {ev.identified ? (
                           <>
-                            <span style={{ fontWeight: 500 }}>{ev.player_name}</span>
+                            <button
+                              className="player-toggle"
+                              aria-expanded={openEventRow === ev.id}
+                              title="Show this player's injury history"
+                              onClick={() => setOpenEventRow(openEventRow === ev.id ? null : ev.id)}
+                            >
+                              <span className="player-toggle-caret">{openEventRow === ev.id ? "▾" : "▸"}</span>
+                              {ev.player_name}
+                            </button>
                             {ev.jersey_number !== null && ev.jersey_number !== undefined && (
                               <span style={{ color: "var(--text-muted)", marginLeft: 6 }}>
                                 #{ev.jersey_number}
@@ -881,6 +1178,16 @@ export default function Dashboard() {
                         }}
                       >
                         {ev.injury_note || ev.note || "—"}
+                        <details style={{ marginTop: 6 }}>
+                          <summary
+                            style={{ cursor: "pointer", fontSize: 12, color: "var(--brand-primary)", fontWeight: 500 }}
+                          >
+                            Safety measures
+                          </summary>
+                          <div style={{ marginTop: 6 }}>
+                            <SafetyMeasures ev={ev} />
+                          </div>
+                        </details>
                       </td>
                       <td>
                         {ev.risk ? (
@@ -923,6 +1230,14 @@ export default function Dashboard() {
                         )}
                       </td>
                     </tr>
+                    {openEventRow === ev.id && ev.identified && (
+                      <tr className="history-row">
+                        <td colSpan={9}>
+                          <PlayerHistory playerId={ev.player_id} playerName={ev.player_name} events={allEvents} />
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
@@ -1072,6 +1387,10 @@ export default function Dashboard() {
                 {clipEvent.injury_note}
               </p>
             )}
+
+            <div style={{ marginTop: 8 }}>
+              <SafetyMeasures ev={clipEvent} />
+            </div>
 
             {clipEvent.gemini_verdict && (
               <div

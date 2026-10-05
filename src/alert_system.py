@@ -4,7 +4,7 @@ from datetime import datetime
 
 import requests
 
-from injury_notes import build_injury_note
+from injury_notes import build_injury_note, build_safety_measures, SAFETY_DISCLAIMER
 import whatsapp_notifier
 
 
@@ -166,6 +166,9 @@ def save_event(
 
     injury_note = build_injury_note(event_type, region, risk)
 
+    # Recommended safety steps (empty list if anything goes wrong, never blocks the alert)
+    safety_measures = build_safety_measures(event_type, region, risk)
+
     movement = round(float(movement or 0), 2)
 
     now = datetime.now()
@@ -214,6 +217,10 @@ def save_event(
     print("MOVEMENT:", movement)
     print("RISK:", risk)
     print("NOTE:", injury_note)
+    if safety_measures:
+        print("SAFETY MEASURES:")
+        for step in safety_measures:
+            print("  -", step)
     print("TIME:", now.strftime("%Y-%m-%d %H:%M:%S"))
     print("====================================")
 
@@ -248,6 +255,16 @@ def save_event(
 
         message += "\nIdentified by: " + describe_identification(identified_by, id_detail, id_confidence)
         message += "\nVideo time: " + format_video_time(video_time_sec)
+
+        # Safety measures go at the end, as plain text lines
+        # (no * or _ so WhatsApp does not turn them into bold/italic)
+        try:
+            if safety_measures:
+                message += "\n\nSafety measures (" + SAFETY_DISCLAIMER + "):"
+                for step in safety_measures:
+                    message += "\n- " + step
+        except Exception as e:
+            print("[WHATSAPP] Could not add safety measures, sending alert without them:", e)
 
         print("[WHATSAPP] Queued alert for:", event_type)
         whatsapp_notifier.send_message(message)

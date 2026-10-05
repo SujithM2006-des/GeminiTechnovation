@@ -689,3 +689,158 @@
   .login-card { padding: 28px 22px; }
   .stats-row { grid-template-columns: 1fr; }
 }
+
+/* ========================================================
+   PLAYER HISTORY DROPDOWN
+   Click a player's name (Team Details or Injury Events) to
+   open their falls, possible injuries and clips under the row.
+   ======================================================== */
+.player-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+}
+
+.player-toggle:hover {
+  color: var(--brand-primary);
+}
+
+.player-toggle-caret {
+  display: inline-block;
+  width: 12px;
+  font-size: 12px;
+  color: var(--brand-primary);
+}
+
+.events-table tbody tr.row-open {
+  background: var(--bg-hover);
+}
+
+.events-table tbody tr.history-row,
+.events-table tbody tr.history-row:hover {
+  background: var(--bg-elevated);
+}
+
+.events-table tbody tr.history-row > td {
+  padding: 0;
+}
+
+.player-history {
+  padding: 16px 18px 18px;
+  border-left: 3px solid var(--brand-primary);
+  animation: fade-in 0.2s ease both;
+}
+
+.player-history-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.player-history-summary strong {
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+.player-history-high {
+  color: var(--risk-high-text);
+  font-weight: 600;
+}
+
+.player-history-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.player-history-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.player-history-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.player-history-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.player-history-area {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.player-history-injury {
+  font-size: 13px;
+  color: var(--text-primary);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--risk-medium-bg);
+  border: 1px solid var(--risk-medium-border);
+}
+
+.player-history-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--risk-medium-text);
+  margin-bottom: 2px;
+}
+
+.player-history-video {
+  width: 100%;
+  border-radius: var(--radius-sm);
+  background: #000;
+  aspect-ratio: 16 / 9;
+}
+
+.player-history-noclip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 8px;
+}
+
+.player-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.player-history-download {
+  font-size: 12px;
+  color: #93c5fd;
+}
