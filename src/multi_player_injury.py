@@ -21,6 +21,7 @@ from alert_system import (
 )
 from player_identifier import PlayerIdentifier
 import gemini_verifier
+import system_status
 
 # START
 
@@ -188,6 +189,42 @@ start_notifications()
 
 if GEMINI_CHECK:
     gemini_verifier.start()
+
+# SYSTEM STATUS — tells the dashboard's System page what this run is using
+# (runs in the background; never slows down or stops detection)
+try:
+    _model_file = getattr(model, "ckpt_path", None) or POSE_MODEL
+    _cuda = torch.cuda.is_available()
+    _status_info = {
+        "match_id": match_id,
+        "match_name": MATCH_NAME,
+        "source_mode": SOURCE_MODE,
+        "video_source": str(SOURCE_CONFIG[SOURCE_MODE]),
+        "device": "GPU" if DEVICE == 0 else "CPU",
+        "gpu_name": torch.cuda.get_device_name(0) if _cuda else None,
+        "pose_model": os.path.basename(str(_model_file)),
+        "model_task": getattr(model, "task", None),
+        "model_file_mb": round(os.path.getsize(_model_file) / 1048576, 1) if os.path.isfile(str(_model_file)) else None,
+        "imgsz": INFER_IMGSZ,
+        "fps": round(EFFECTIVE_FPS, 2),
+        "total_frames": total_frames if total_frames > 0 else None,
+        "ultralytics_version": system_status.library_version("ultralytics"),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda if _cuda else None,
+        "opencv_version": cv2.__version__,
+        "identification": identifier is not None,
+        "face_enabled": bool(ENABLE_FACE and identifier is not None),
+        "face_ready": bool(identifier is not None and identifier.face_ready),
+        "ocr_engines": system_status.loaded_libraries(system_status._OCR_LIBRARIES),
+        "face_engines": system_status.loaded_libraries(system_status._FACE_LIBRARIES),
+        "gemini_enabled": bool(GEMINI_CHECK),
+        "gemini_available": bool(GEMINI_CHECK and gemini_verifier.is_available()),
+        "collision_alerts": ENABLE_COLLISION_ALERTS,
+    }
+    _status_info.update(system_status.tracker_details(TRACKER_CONFIG))
+    system_status.start(_status_info)
+except Exception as e:
+    print("[STATUS] Could not prepare the System page report (detection continues):", e)
 
 print("Starting video loop...")
 print("Press Q to quit")
@@ -1110,6 +1147,12 @@ while True:
         print("End of video reached (or read failed)")
         break
     frame_count += 1
+    system_status.update(
+        frame=frame_count,
+        events=len(event_log),
+        pending_identification=len(pending_identification),
+        tracks_identified=len(track_identity),
+    )
     if detect_scene_cut(frame):
         scene_cut_frames.append(frame_count)
         scene_cut_frames[:] = scene_cut_frames[-200:]
@@ -1237,6 +1280,10 @@ while True:
                 if not face_announced and identifier.face_ready:
                     face_announced = True
                     print("[ID] Face recognition: ON (faces learned automatically from jersey reads)")
+                    system_status.add_info(
+                        face_ready=True,
+                        face_engines=system_status.loaded_libraries(system_status._FACE_LIBRARIES),
+                    )
 
             # FALLS ONLY DURING PLAY: not on close-ups of coaches/crowd, and only when legs are visible
             is_closeup = box_height > MAX_BOX_HEIGHT_FRACTION * frame_h
@@ -1505,6 +1552,15 @@ event_log[:] = [e for e in event_log if e["event_id"] not in gemini_verifier.del
 
 falls_saved = [e for e in event_log if e["event"].startswith("FALL")]
 falls_identified = [e for e in falls_saved if e["player"] != "Unidentified"]
+
+system_status.finish(
+    frame=frame_count,
+    events=len(event_log),
+    falls=len(falls_saved),
+    falls_identified=len(falls_identified),
+    pending_identification=0,
+    tracks_identified=len(track_identity),
+)
 id_rate = (100.0 * len(falls_identified) / len(falls_saved)) if falls_saved else 0.0
 
 print()

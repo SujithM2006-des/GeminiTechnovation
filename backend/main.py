@@ -1095,3 +1095,340 @@ def clear_all_injury_events(current_user: User = Depends(get_current_user), db: 
     db.commit()
 
     return {"message": "All injury events deleted. Players were kept.", "deleted_events": deleted}
+
+
+# ============================================
+# ADMIN — USER ACCOUNTS (Users page in the dashboard)
+# The admin creates a login: username (plain text like "coach3"),
+# a starting password and a role. A coach must be linked to a team
+# because coaches only see their own team's events.
+# Passwords are stored hashed, exactly the way /auth/login checks them.
+# ============================================
+
+USER_ROLES = ("admin", "medical", "coach")
+MIN_PASSWORD_LENGTH = 6
+MAX_PASSWORD_LENGTH = 72      # bcrypt only uses the first 72 bytes
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str                         # admin / medical / coach
+    team_id: Optional[int] = None     # required for coach, ignored otherwise
+
+
+def user_to_dict(u: User):
+
+    return {
+        "id": u.id,
+        "username": u.username,
+        "role": u.role,
+        "team_id": u.team_id,
+        "team_name": u.team.name if u.team is not None else None,
+    }
+
+
+def _require_admin(current_user: User):
+
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can manage user accounts")
+
+
+@app.get("/admin/users")
+def list_users(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    _require_admin(current_user)
+
+    users = db.query(User).order_by(User.role, User.username).all()
+
+    return [user_to_dict(u) for u in users]
+
+
+@app.post("/admin/users")
+def create_user(
+    request: UserCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    _require_admin(current_user)
+
+    username = (request.username or "").strip()
+    password = request.password or ""
+    role = (request.role or "").strip().lower()
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    if any(ch.isspace() for ch in username):
+        raise HTTPException(status_code=400, detail="Username cannot contain spaces")
+
+    if len(username) > 50:
+        raise HTTPException(status_code=400, detail="Username must be 50 characters or fewer")
+
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="Password must be at least " + str(MIN_PASSWORD_LENGTH) + " characters")
+
+    if len(password.encode("utf-8")) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="Password must be " + str(MAX_PASSWORD_LENGTH) + " characters or fewer")
+
+    if role not in USER_ROLES:
+        raise HTTPException(status_code=400, detail="Role must be admin, medical or coach")
+
+    taken = db.query(User).filter(func.lower(User.username) == username.lower()).first()
+
+    if taken is not None:
+        raise HTTPException(status_code=409, detail="Username '" + username + "' is already taken")
+
+    team_id = None
+
+    if role == "coach":
+
+        if request.team_id is None:
+            raise HTTPException(status_code=400, detail="Pick the team this coach manages")
+
+        team = db.query(Team).filter(Team.id == request.team_id).first()
+
+        if team is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        team_id = team.id
+
+    user = User(
+        username=username,
+        password_hash=pwd_context.hash(password),
+        role=role,
+        team_id=team_id,
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    print("[USERS]", current_user.username, "created", username, "(" + role + ")")
+
+    return {"message": "User created", "user": user_to_dict(user)}
+
+
+@app.delete("/admin/users/{user_id}")
+def delete_user(user_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    _require_admin(current_user)
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+
+    if user.role == "admin" and db.query(User).filter(User.role == "admin").count() <= 1:
+        raise HTTPException(status_code=400, detail="At least one admin account must remain")
+
+    username = user.username
+
+    db.delete(user)
+    db.commit()
+
+    print("[USERS]", current_user.username, "deleted", username)
+
+    return {"message": "User " + username + " deleted", "deleted_user_id": user_id}
+
+
+# ============================================
+# SYSTEM STATUS (System page in the dashboard)
+# The detector (src/system_status.py) reports what it is using when it starts,
+# sends a heartbeat every few seconds while it runs, and reports again when it
+# finishes. The report is kept in output/detector_status.json (no database change).
+# GET /admin/system combines that report with live checks of the backend,
+# the database and the medical knowledge base (src/injury_notes.py).
+# ============================================
+
+import json
+import platform
+import importlib.util
+from datetime import datetime, timezone
+
+DETECTOR_STATUS_FILE = os.path.join(PROJECT_ROOT, "output", "detector_status.json")
+INJURY_NOTES_FILE = os.path.join(PROJECT_ROOT, "src", "injury_notes.py")
+HEARTBEAT_STALE_SECONDS = 30      # no heartbeat for this long while "running" = stopped unexpectedly
+
+
+class DetectorStatusRequest(BaseModel):
+    state: str                                  # starting / running / finished
+    info: dict = {}                             # model, tracker, OCR, versions... (sent at start)
+    progress: dict = {}                         # frame, total_frames, events... (sent with every heartbeat)
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def _read_detector_status():
+    try:
+        with open(DETECTOR_STATUS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+@app.post("/system/detector-status")
+def report_detector_status(request: DetectorStatusRequest):
+
+    state = (request.state or "").strip().lower()
+
+    if state not in ("starting", "running", "finished"):
+        raise HTTPException(status_code=400, detail="state must be starting, running or finished")
+
+    current = _read_detector_status() or {}
+
+    # a new run starts fresh; heartbeats only update progress
+    if state == "starting":
+        current = {"info": request.info or {}, "started_at": _now_utc().isoformat()}
+    elif request.info:
+        current.setdefault("info", {}).update(request.info)
+
+    current["state"] = state
+    current["progress"] = request.progress or current.get("progress", {})
+    current["last_seen"] = _now_utc().isoformat()
+
+    if state == "finished":
+        current["finished_at"] = current["last_seen"]
+
+    tmp = DETECTOR_STATUS_FILE + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(DETECTOR_STATUS_FILE), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(current, f, default=str)
+        os.replace(tmp, DETECTOR_STATUS_FILE)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail="Could not save detector status: " + str(e))
+
+    return {"message": "Status saved", "state": state}
+
+
+def _medical_knowledge_base():
+
+    if not os.path.isfile(INJURY_NOTES_FILE):
+        return {"ok": False, "detail": "src/injury_notes.py not found"}
+
+    try:
+        spec = importlib.util.spec_from_file_location("injury_notes_status_check", INJURY_NOTES_FILE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        notes = getattr(module, "NOTES", {}) or {}
+        measures = getattr(module, "SAFETY_MEASURES", {}) or {}
+
+        note_count = sum(len(v) for v in notes.values())
+        measure_sets = sum(len(v) for v in measures.values())
+        measure_steps = sum(len(steps) for v in measures.values() for steps in v.values())
+
+        return {
+            "ok": note_count > 0,
+            "risk_levels": sorted(notes.keys()),
+            "injury_notes": note_count,
+            "safety_measure_sets": measure_sets,
+            "safety_measure_steps": measure_steps,
+            "has_collision_rules": hasattr(module, "COLLISION_MEASURES"),
+        }
+
+    except Exception as e:
+        return {"ok": False, "detail": "injury_notes.py could not be loaded: " + str(e)}
+
+
+@app.get("/admin/system")
+def system_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    _require_admin(current_user)
+
+    now = _now_utc()
+
+    # ---- database (the query itself proves it is reachable) ----
+    try:
+        db.execute(text("SELECT 1"))
+        database = {
+            "ok": True,
+            "engine": db.get_bind().dialect.name,
+            "users": db.query(func.count(User.id)).scalar() or 0,
+            "teams": db.query(func.count(Team.id)).scalar() or 0,
+            "players": db.query(func.count(Player.id)).scalar() or 0,
+            "matches": db.query(func.count(MatchSession.id)).scalar() or 0,
+            "events": db.query(func.count(InjuryEvent.id)).scalar() or 0,
+        }
+    except Exception as e:
+        database = {"ok": False, "detail": str(e)}
+
+    # ---- identification results so far ----
+    identity = {}
+    try:
+        total = db.query(func.count(InjuryEvent.id)).scalar() or 0
+        identified = db.query(func.count(InjuryEvent.id)).filter(InjuryEvent.player_id.isnot(None)).scalar() or 0
+        by_method = (
+            db.query(InjuryEvent.identified_by, func.count(InjuryEvent.id))
+            .filter(InjuryEvent.player_id.isnot(None))
+            .group_by(InjuryEvent.identified_by)
+            .all()
+        )
+        gemini_checked = db.query(func.count(InjuryEvent.id)).filter(InjuryEvent.gemini_verdict.isnot(None)).scalar() or 0
+        identity = {
+            "events": total,
+            "identified": identified,
+            "unidentified": total - identified,
+            "by_method": {(m or "unknown"): c for m, c in by_method},
+            "gemini_checked": gemini_checked,
+        }
+    except Exception as e:
+        identity = {"detail": str(e)}
+
+    # ---- last job ----
+    last_job = None
+    try:
+        m = db.query(MatchSession).order_by(MatchSession.date.desc()).first()
+        if m is not None:
+            ev_count = db.query(func.count(InjuryEvent.id)).filter(InjuryEvent.match_session_id == m.id).scalar() or 0
+            ev_ident = (
+                db.query(func.count(InjuryEvent.id))
+                .filter(InjuryEvent.match_session_id == m.id, InjuryEvent.player_id.isnot(None))
+                .scalar()
+            ) or 0
+            last_job = {
+                "id": m.id,
+                "name": m.name or ("Match #" + str(m.id)),
+                "video_source": m.video_source,
+                "date": m.date,
+                "events": ev_count,
+                "identified": ev_ident,
+            }
+    except Exception:
+        last_job = None
+
+    # ---- detector (from its last report) ----
+    detector = _read_detector_status()
+
+    if detector is None:
+        detector = {"state": "never", "info": {}, "progress": {}}
+    else:
+        seconds_ago = None
+        try:
+            seconds_ago = (now - datetime.fromisoformat(detector.get("last_seen"))).total_seconds()
+        except (TypeError, ValueError):
+            pass
+        detector["seconds_since_last_signal"] = round(seconds_ago) if seconds_ago is not None else None
+        if detector.get("state") in ("starting", "running") and (seconds_ago is None or seconds_ago > HEARTBEAT_STALE_SECONDS):
+            detector["state"] = "stopped"          # closed or crashed without saying "finished"
+
+    return {
+        "checked_at": now.isoformat(),
+        "backend": {
+            "ok": True,
+            "python": platform.python_version(),
+            "heartbeat_timeout_seconds": HEARTBEAT_STALE_SECONDS,
+        },
+        "database": database,
+        "detector": detector,
+        "identity": identity,
+        "medical_knowledge_base": _medical_knowledge_base(),
+        "last_job": last_job,
+    }

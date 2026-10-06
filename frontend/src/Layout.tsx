@@ -1,0 +1,92 @@
+import { useState, type FormEvent } from 'react'
+import { Link, NavLink, Navigate, Outlet, useNavigate } from 'react-router-dom'
+import { LayoutDashboard, Users, Shield, CalendarDays, Activity, Zap, Bell, FileText, UserCog, Server, Settings, Menu, PanelLeft, Search, LogOut, HelpCircle, ChevronDown, type LucideIcon } from 'lucide-react'
+import { useAuth, home } from './auth'
+import type { Role } from './types'
+import { useEvents } from './queries'
+import { Badge, RiskBadge } from './ui'
+
+type N = { label: string; to: string; icon: LucideIcon }
+const common = (): N[] => [
+  { label: 'Players', to: '/players', icon: Users },
+  { label: 'Matches', to: '/matches', icon: CalendarDays },
+  { label: 'Events', to: '/events', icon: Activity },
+  { label: 'Collisions', to: '/collisions', icon: Zap },
+  { label: 'Alerts', to: '/alerts', icon: Bell },
+]
+export const navFor = (r: Role): N[] => {
+  const dash: N = { label: 'Dashboard', to: home[r], icon: LayoutDashboard }
+  const set: N = { label: 'Settings', to: '/settings', icon: Settings }
+  const rep: N = { label: 'Reports', to: '/reports', icon: FileText }
+  // Admin menu: no Players, Matches or Collisions. Players live inside "Teams & Players";
+  // the other pages still open from links inside events.
+  const adminCommon = common().filter((i) => i.to !== '/players' && i.to !== '/matches' && i.to !== '/collisions')
+  if (r === 'ADMIN') return [dash, { label: 'Teams & Players', to: '/teams', icon: Shield }, ...adminCommon, rep, { label: 'Users', to: '/admin/users', icon: UserCog }, { label: 'System', to: '/admin/system', icon: Server }, set]
+  if (r === 'MEDICAL') return [dash, ...common(), rep, set]
+  return [dash, { label: 'My Team', to: '/teams', icon: Shield }, ...common(), set]
+}
+
+export default function Layout() {
+  const { user, logout } = useAuth()
+  const nav = useNavigate()
+  const [collapsed, setCollapsed] = useState(false)
+  const [drawer, setDrawer] = useState(false)
+  const [bell, setBell] = useState(false)
+  const [menu, setMenu] = useState(false)
+  const [q, setQ] = useState('')
+  const events = useEvents()
+  if (!user) return <Navigate to="/login" replace />
+
+  const items = navFor(user.role)
+  const high = (events.data ?? []).filter((e) => e.risk === 'HIGH')
+  const search = (e: FormEvent) => { e.preventDefault(); nav(`/events?q=${encodeURIComponent(q)}`) }
+
+  const side = (mobile: boolean) => (
+    <nav aria-label="Main" className="flex h-full flex-col bg-[#0b1f3a] text-slate-200">
+      <div className="flex h-16 items-center gap-2 px-4 text-white"><Shield className="shrink-0 text-sky-400" size={26} />{(mobile || !collapsed) && <div><p className="font-bold leading-tight">AthleteGuard</p><p className="text-[10px] text-slate-400">Injury Detection</p></div>}</div>
+      <ul className="flex-1 space-y-1 overflow-y-auto px-2 py-2">
+        {items.map((i) => (
+          <li key={i.to}><NavLink to={i.to} onClick={() => setDrawer(false)} title={i.label} className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2 text-sm ${isActive ? 'bg-sky-500/20 text-white' : 'hover:bg-white/10'}`}><i.icon size={18} className="shrink-0" />{(mobile || !collapsed) && i.label}</NavLink></li>
+        ))}
+      </ul>
+      <NavLink to="/help" onClick={() => setDrawer(false)} className="m-2 flex items-center gap-3 rounded-lg px-3 py-2 text-sm hover:bg-white/10"><HelpCircle size={18} className="shrink-0" />{(mobile || !collapsed) && 'Help'}</NavLink>
+    </nav>
+  )
+
+  return (
+    <div className="flex min-h-screen">
+      <aside className={`hidden shrink-0 bg-[#0b1f3a] lg:block ${collapsed ? 'w-16' : 'w-60'}`}><div className="sticky top-0 h-screen">{side(false)}</div></aside>
+      {drawer && <div className="fixed inset-0 z-40 lg:hidden"><div className="absolute inset-0 bg-slate-900/50" onClick={() => setDrawer(false)} /><div className="relative h-full w-64">{side(true)}</div></div>}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-slate-200 bg-white px-4">
+          <button aria-label="Open menu" className="lg:hidden" onClick={() => setDrawer(true)}><Menu /></button>
+          <button aria-label="Collapse sidebar" className="hidden lg:block" onClick={() => setCollapsed((c) => !c)}><PanelLeft /></button>
+          <form onSubmit={search} className="relative max-w-md flex-1" role="search"><Search size={16} className="absolute left-3 top-2.5 text-slate-400" /><input aria-label="Search events, players" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search players, events…" className="w-full rounded-lg border border-slate-300 py-2 pl-9 pr-3 text-sm" /></form>
+          <div className="relative ml-auto">
+            <button aria-label={`Notifications, ${high.length} high-risk`} onClick={() => { setBell((b) => !b); setMenu(false) }} className="relative rounded-lg p-2 hover:bg-slate-100">
+              <Bell size={20} />
+              {high.length > 0 && <span className="absolute -right-0.5 -top-0.5 grid h-5 min-w-5 place-items-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white">{high.length > 99 ? '99+' : high.length}</span>}
+            </button>
+            {bell && (
+              <div className="absolute right-0 mt-2 w-80 rounded-xl border border-slate-200 bg-white p-4 text-sm shadow-lg">
+                <p className="font-semibold">Notifications</p>
+                {high.length === 0 ? <p className="py-4 text-center text-slate-500">No unread alerts</p> : (
+                  <ul className="mt-2 divide-y divide-slate-100">{high.slice(0, 5).map((e) => (
+                    <li key={e.id}><Link to={`/events/${e.id}`} onClick={() => setBell(false)} className="flex items-center justify-between gap-2 rounded-lg px-2 py-2 hover:bg-slate-50"><span className="truncate">{e.player.name ?? 'Unidentified'} · {e.region ?? '—'}</span><RiskBadge level={e.risk} /></Link></li>
+                  ))}</ul>
+                )}
+                <button className="mt-2 inline-flex w-full items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setBell(false); nav('/alerts') }}>View all alerts</button>
+              </div>
+            )}
+          </div>
+          <div className="relative">
+            <button onClick={() => { setMenu((m) => !m); setBell(false) }} className="flex items-center gap-2 rounded-lg p-1.5 hover:bg-slate-100" aria-haspopup="menu" aria-expanded={menu}><span className="grid h-8 w-8 place-items-center rounded-full bg-[#0b1f3a] text-xs font-bold text-white">{(user.name[0] || '?').toUpperCase()}</span><span className="hidden text-left text-xs sm:block"><b className="block">{user.name}</b>{user.role}</span><ChevronDown size={14} /></button>
+            {menu && <div role="menu" className="absolute right-0 mt-2 w-44 rounded-xl border border-slate-200 bg-white p-1 text-sm shadow-lg"><button role="menuitem" className="block w-full rounded px-3 py-2 text-left hover:bg-slate-100" onClick={() => { setMenu(false); nav('/settings') }}>Profile & settings</button><button role="menuitem" className="flex w-full items-center gap-2 rounded px-3 py-2 text-left text-red-700 hover:bg-slate-100" onClick={() => { logout(); nav('/login', { replace: true }) }}><LogOut size={14} />Log out</button></div>}
+          </div>
+        </header>
+        {user.dev && <div className="bg-amber-100 px-4 py-1.5 text-center text-xs font-semibold text-amber-900">DEV PREVIEW: not authenticated, no backend data. <Badge tone="amber">DEV DATA</Badge></div>}
+        <main className="flex-1 p-4 md:p-6"><Outlet /></main>
+      </div>
+    </div>
+  )
+}
