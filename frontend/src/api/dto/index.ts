@@ -122,3 +122,64 @@ export interface SystemDto {
   medical_knowledge_base: { ok: boolean; risk_levels?: string[]; injury_notes?: number; safety_measure_sets?: number; safety_measure_steps?: number; has_collision_rules?: boolean; detail?: string }
   last_job: { id: number; name: string; video_source: string | null; date: string | null; events: number; identified: number } | null
 }
+/** GET /events/{id}/assessment, GET /assessments. Coaches only get event_id, status, saved_at, saved_by. */
+export interface AssessmentDto {
+  event_id: number
+  status: string
+  saved_at: string
+  saved_by: string
+  pain?: string
+  swelling?: string
+  tenderness?: string
+  rom?: string
+  weight?: string
+  neuro?: string
+  notes?: string
+  imaging?: string
+  impression?: string
+  created_at?: string
+  revision?: number
+}
+
+/** GET /detector/status — the detector's live progress for match pages (every role). */
+export interface DetectorProgressDto {
+  state: 'never' | 'starting' | 'running' | 'finished' | 'stopped'
+  match_id?: number | null
+  match_name?: string | null
+  frame?: number | null
+  total_frames?: number | null
+  events?: number | null
+  started_at?: string | null
+  finished_at?: string | null
+  seconds_since_last_signal?: number | null
+}
+
+/** GET /players/{id}/photos — reference photos in the known_players folder. */
+export interface PlayerPhotosDto {
+  player_id: number
+  folder: string
+  photos: { name: string; size: number; uploaded_at: string }[]
+  auto_learned: number
+}
+
+/** GET /injury-history — previous injuries typed in by a coach (own team) or admin. */
+export interface InjuryHistoryDto {
+  id: number
+  player_id: number
+  player_name: string | null
+  jersey_number: number | null
+  team_id: number | null
+  team_name: string | null
+  injury: string
+  body_area: string
+  injury_date: string
+  severity: string
+  status: string
+  days_out: number | null
+  notes: string
+  added_by: string
+  added_at: string
+  updated_by?: string
+  updated_at?: string
+  can_edit: boolean
+}

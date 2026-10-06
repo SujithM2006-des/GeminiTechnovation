@@ -1,16 +1,17 @@
-import { Fragment, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useState, type ReactNode } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Shield, Eye, EyeOff, Plus, Play, Pause, Square, RotateCcw, Maximize, Upload, VideoOff, CheckCheck, Download, RefreshCw, WifiOff, Lock, FileQuestion, ServerCrash, Cpu, ChevronRight, ChevronDown, ClipboardPlus, Trash2, Sparkles, UserCheck, History, ExternalLink } from 'lucide-react'
+import { Shield, Eye, EyeOff, Plus, Play, Pause, Square, RotateCcw, Maximize, Upload, VideoOff, CheckCheck, Download, RefreshCw, WifiOff, Lock, FileQuestion, ServerCrash, Cpu, ChevronRight, ChevronDown, ClipboardPlus, Trash2, Sparkles, UserCheck, History, ExternalLink, ImageOff, CheckCircle2, Pencil, Loader2, Activity, Bell, Zap, FileText, CalendarDays, Users, HeartPulse, type LucideIcon } from 'lucide-react'
 import { useAuth, home } from './auth'
-import { assignPlayer, clearAllEvents, createUser, deleteUser, getSystemStatus, getUsers, logManualEvent } from './api/services'
+import { addInjuryHistory, assignPlayer, changePassword, clearAllEvents, createUser, deleteInjuryHistory, deletePlayerPhoto, deleteUser, getAssessment, getMe, getPlayerPhotoBlob, getPlayerPhotos, getSystemStatus, getUsers, logManualEvent, markAlertsRead, reopenEvent, resolveEvent, saveAssessment, updateInjuryHistory, uploadPlayerPhoto, type AssessmentInput, type InjuryHistoryInput } from './api/services'
 import { normalizeApiError } from './api/client'
 import type { AppUser } from './api/mappers'
-import type { DetectorInfoDto, SystemDto } from './api/dto'
-import { useEvents, useMatches, usePlayers, useTeams } from './queries'
+import type { AssessmentDto, DetectorInfoDto, DetectorProgressDto, InjuryHistoryDto, SystemDto } from './api/dto'
+import { useAlertReads, useAssessments, useDetector, useEvents, useInjuryHistory, useMatches, usePlayers, useTeams } from './queries'
+import { DEFAULT_PREFS, dateOptions, savePrefs, usePrefs, type Prefs } from './prefs'
 import type { InjuryEvent, Player, RiskLevel, Role } from './types'
 import { safetyMeasures, SAFETY_DISCLAIMER } from './safety'
 import { Badge, Card, Confirm, Disclaimer, EmptyState, ErrorState, Field, IdentityBadge, Modal, Na, PageHeader, RiskBadge, SafetyMeasures, Skeleton, btn, btnD, btnP, btnS, inp, inpAuto, useToast, type Tone } from './ui'
@@ -47,7 +48,7 @@ const fmtVideo = (s: number | null) => {
   const x = Math.floor(s)
   return `${Math.floor(x / 3600)}:${String(Math.floor((x % 3600) / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`
 }
-const fmtDate = (v: string | null) => (v ? new Date(v).toLocaleString() : '—')
+const fmtDate = (v: string | null) => (v ? new Date(v).toLocaleString(undefined, dateOptions()) : '—')
 const fileName = (p: string | null) => (p ? p.split(/[\\/]/).pop() ?? p : '—')
 
 const geminiBadge = (e: InjuryEvent): { text: string; tone: Tone } | null => {
@@ -144,10 +145,12 @@ function PlayerHistory({ playerId, name }: { playerId: number; name: string }) {
   const q = useEvents()
   if (q.isLoading) return <div className="space-y-2 p-4"><Skeleton /><Skeleton /></div>
   const list = (q.data ?? []).filter((e) => e.player.playerId === playerId).sort((a, b) => +new Date(b.timestamp) - +new Date(a.timestamp))
-  if (!list.length) return <p className="p-4 text-sm text-slate-500">No injury events recorded for {name}.</p>
   const high = list.filter((e) => e.risk === 'HIGH').length
   return (
     <div className="border-l-4 border-sky-500 bg-slate-50 p-4">
+      <PreviousInjuries playerId={playerId} name={name} />
+      <h3 className="mb-2 mt-5 text-sm font-semibold text-slate-700">Detected falls</h3>
+      {!list.length ? <p className="rounded-xl border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">No injury events recorded for {name}.</p> : <>
       <p className="mb-3 text-sm text-slate-600">
         <b className="text-slate-900">{name}</b> · {list.length} event{list.length === 1 ? '' : 's'}
         {high > 0 && <span className="font-semibold text-red-700"> · {high} high risk</span>} · latest {fmtDate(list[0].timestamp)}
@@ -190,6 +193,7 @@ function PlayerHistory({ playerId, name }: { playerId: number; name: string }) {
           </div>
         ))}
       </div>
+      </>}
     </div>
   )
 }
@@ -201,6 +205,221 @@ const PlayerToggle = ({ open, onClick, children }: { open: boolean; onClick: () 
     {children}
   </button>
 )
+
+/* ---------- PREVIOUS INJURY HISTORY (typed in by a coach for their own team, or admin). Saved in output/injury_history.json ---------- */
+const HISTORY_AREAS = ['Head', 'Neck', 'Shoulder', 'Arm', 'Elbow', 'Wrist / Hand', 'Chest', 'Back', 'Hip / Groin', 'Thigh', 'Hamstring', 'Knee', 'Lower leg', 'Ankle', 'Foot', 'Other']
+const HISTORY_SEVERITY = ['Minor', 'Moderate', 'Severe']
+const HISTORY_STATUS = ['Recovered', 'Recovering', 'Ongoing']
+const SEVERITY_TONE: Record<string, Tone> = { Minor: 'green', Moderate: 'amber', Severe: 'red' }
+const HSTATUS_TONE: Record<string, Tone> = { Recovered: 'green', Recovering: 'amber', Ongoing: 'red' }
+const todayISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` }
+const fmtDay = (iso: string) => { const d = new Date(iso + 'T00:00:00'); return isNaN(+d) ? iso : d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' }) }
+
+/** Admin edits every player; a coach edits their own team. */
+const canEditHistory = (u: { role: Role; teamId: number | null; dev?: boolean } | null, p?: { teamId: number }) =>
+  !!u && !u.dev && !!p && (u.role === 'ADMIN' || (u.role === 'COACH' && u.teamId === p.teamId))
+
+const hs = z.object({
+  playerId: z.string().min(1, 'Player is required'),
+  injury: z.string().trim().min(1, 'Injury is required').max(120, 'Keep it under 120 characters'),
+  body_area: z.string().min(1, 'Body area is required'),
+  injury_date: z.string().min(1, 'Date is required').refine((v) => v <= todayISO(), 'The date cannot be in the future'),
+  severity: z.string().min(1, 'Severity is required'),
+  status: z.string().min(1, 'Status is required'),
+  days_out: z.string().refine((v) => v.trim() === '' || (/^\d+$/.test(v.trim()) && Number(v) <= 1000), 'Enter a number from 0 to 1000'),
+  notes: z.string().max(1000, 'Keep it under 1000 characters'),
+})
+type HistoryForm = z.infer<typeof hs>
+
+function InjuryHistoryModal({ onClose, players, playerId, record }: { onClose: () => void; players: Player[]; playerId?: number; record?: InjuryHistoryDto }) {
+  const toast = useToast()
+  const qc = useQueryClient()
+  const [err, setErr] = useState('')
+  const fixed = record?.player_id ?? playerId
+  const f = useForm<HistoryForm>({
+    resolver: zodResolver(hs),
+    defaultValues: record
+      ? { playerId: String(record.player_id), injury: record.injury, body_area: record.body_area, injury_date: record.injury_date, severity: record.severity, status: record.status, days_out: record.days_out === null || record.days_out === undefined ? '' : String(record.days_out), notes: record.notes ?? '' }
+      : { playerId: fixed ? String(fixed) : '', injury: '', body_area: '', injury_date: '', severity: '', status: '', days_out: '', notes: '' },
+  })
+  const submit = f.handleSubmit(async (v) => {
+    setErr('')
+    const body: InjuryHistoryInput = { injury: v.injury.trim(), body_area: v.body_area, injury_date: v.injury_date, severity: v.severity, status: v.status, days_out: v.days_out.trim() === '' ? null : Number(v.days_out), notes: v.notes.trim() }
+    try {
+      if (record) await updateInjuryHistory(record.id, body)
+      else await addInjuryHistory(Number(v.playerId), body)
+      qc.invalidateQueries({ queryKey: ['injuryHistory'] })
+      const p = players.find((x) => String(x.id) === v.playerId)
+      toast(record ? `Injury updated for ${p?.name ?? 'the player'}.` : `Injury added to ${p?.name ?? 'the player'}'s history.`)
+      onClose()
+    } catch (x) { setErr(normalizeApiError(x)) }
+  })
+  const E = (n: keyof HistoryForm) => f.formState.errors[n]?.message
+  const fixedPlayer = players.find((x) => x.id === fixed)
+  return (
+    <Modal open title={record ? 'Edit previous injury' : 'Add previous injury'} onClose={onClose}>
+      <form className="grid gap-3 sm:grid-cols-2" noValidate onSubmit={submit}>
+        <div className="sm:col-span-2">
+          {fixed ? <p className="rounded-lg bg-slate-50 p-3 text-sm">Player: <b>{fixedPlayer ? `${fixedPlayer.name} #${fixedPlayer.jersey}` : record?.player_name ?? `#${fixed}`}</b></p>
+            : <Field label="Player *" err={E('playerId')}><select className={inp} {...f.register('playerId')}><option value="">Select…</option>{players.map((p) => <option key={p.id} value={p.id}>{p.name} (#{p.jersey})</option>)}</select></Field>}
+        </div>
+        <div className="sm:col-span-2"><Field label="Injury *" err={E('injury')}><input className={inp} placeholder="e.g. Hamstring strain, ACL tear, ankle sprain" {...f.register('injury')} /></Field></div>
+        <Field label="Body area *" err={E('body_area')}><select className={inp} {...f.register('body_area')}><option value="">Select…</option>{HISTORY_AREAS.map((x) => <option key={x}>{x}</option>)}</select></Field>
+        <Field label="Date of injury *" err={E('injury_date')}><input type="date" max={todayISO()} className={inp} {...f.register('injury_date')} /></Field>
+        <Field label="Severity *" err={E('severity')}><select className={inp} {...f.register('severity')}><option value="">Select…</option>{HISTORY_SEVERITY.map((x) => <option key={x}>{x}</option>)}</select></Field>
+        <Field label="Current status *" err={E('status')}><select className={inp} {...f.register('status')}><option value="">Select…</option>{HISTORY_STATUS.map((x) => <option key={x}>{x}</option>)}</select></Field>
+        <Field label="Days out of play" err={E('days_out')}><input inputMode="numeric" className={inp} placeholder="Optional" {...f.register('days_out')} /></Field>
+        <div className="sm:col-span-2"><Field label="Notes" err={E('notes')}><textarea rows={3} className={inp} placeholder="Treatment, surgery, return-to-play notes…" {...f.register('notes')} /></Field></div>
+        {err && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800 sm:col-span-2">{err}</p>}
+        <div className="flex justify-end gap-2 sm:col-span-2"><button type="button" className={btnS} onClick={onClose}>Cancel</button><button className={btnP} disabled={f.formState.isSubmitting}>{f.formState.isSubmitting ? 'Saving…' : record ? 'Save changes' : 'Add injury'}</button></div>
+      </form>
+    </Modal>
+  )
+}
+
+/** One card per previous injury, newest first, with edit/delete for coach (own team) and admin. */
+function InjuryRecordList({ records, players, emptyText }: { records: InjuryHistoryDto[]; players: Player[]; emptyText: string }) {
+  const toast = useToast()
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState<InjuryHistoryDto | null>(null)
+  const [removing, setRemoving] = useState<InjuryHistoryDto | null>(null)
+  const remove = async (r: InjuryHistoryDto) => {
+    try { await deleteInjuryHistory(r.id); qc.invalidateQueries({ queryKey: ['injuryHistory'] }); toast('Injury removed from the history.') } catch (x) { toast(normalizeApiError(x), true) }
+  }
+  if (!records.length) return <p className="rounded-xl border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">{emptyText}</p>
+  return (
+    <>
+      <ul className="space-y-2">
+        {records.map((r) => (
+          <li key={r.id} className="rounded-xl border border-slate-200 bg-white p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="font-semibold">{r.injury}</p>
+              <span className="text-sm text-slate-500">· {r.body_area}</span>
+              <Badge tone={SEVERITY_TONE[r.severity] ?? 'gray'}>{r.severity}</Badge>
+              <Badge tone={HSTATUS_TONE[r.status] ?? 'gray'}>{r.status}</Badge>
+              {r.can_edit && <span className="ml-auto flex gap-1">
+                <button className={btnSm} onClick={() => setEditing(r)}><Pencil size={14} />Edit</button>
+                <button className={btnSm + ' !text-red-700'} onClick={() => setRemoving(r)}><Trash2 size={14} />Delete</button>
+              </span>}
+            </div>
+            <p className="mt-1 text-xs text-slate-500">{fmtDay(r.injury_date)}{r.days_out !== null && r.days_out !== undefined ? ` · ${r.days_out} day${r.days_out === 1 ? '' : 's'} out` : ''} · added by {r.added_by}{r.updated_by ? ` · edited by ${r.updated_by}` : ''}</p>
+            {r.notes && <p className="mt-1 text-sm text-slate-700">{r.notes}</p>}
+          </li>
+        ))}
+      </ul>
+      {editing && <InjuryHistoryModal record={editing} players={players} onClose={() => setEditing(null)} />}
+      <Confirm open={!!removing} title="Delete this injury record?" text={removing ? `${removing.injury} (${fmtDay(removing.injury_date)}) will be removed from ${removing.player_name ?? 'the player'}'s history.` : ''} confirmLabel="Delete" onConfirm={() => removing && remove(removing)} onClose={() => setRemoving(null)} />
+    </>
+  )
+}
+
+/** "Previous injury history" block shown above the detected falls in every player dropdown / player page. */
+function PreviousInjuries({ playerId, name }: { playerId: number; name: string }) {
+  const { user } = useAuth()
+  const players = usePlayers().data ?? []
+  const player = players.find((p) => p.id === playerId)
+  const coachOther = user?.role === 'COACH' && !!player && player.teamId !== user.teamId
+  const h = useInjuryHistory(!coachOther)
+  const [adding, setAdding] = useState(false)
+  const records = (h.data ?? []).filter((r) => r.player_id === playerId)
+  const canEdit = canEditHistory(user, player)
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-700"><HeartPulse size={16} className="text-rose-600" />Previous injury history{records.length > 0 && <span className="font-normal text-slate-500">· {records.length} record{records.length === 1 ? '' : 's'}</span>}</h3>
+        {canEdit && <button className={btnSm + ' ml-auto'} onClick={() => setAdding(true)}><Plus size={14} />Add injury</button>}
+      </div>
+      {user?.dev ? <p className="rounded-xl border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">Log in with a real account to see injury history.</p>
+        : coachOther ? <p className="rounded-xl border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">Injury history is only shown for your own team's players.</p>
+        : h.isLoading ? <Skeleton />
+        : h.isError ? <p role="alert" className="rounded-xl bg-red-50 p-3 text-sm text-red-800">Could not load injury history: {normalizeApiError(h.error)}</p>
+        : <InjuryRecordList records={records} players={players} emptyText={`No previous injuries recorded for ${name}.${canEdit ? ' Use "Add injury" to record one.' : ''}`} />}
+      {adding && <InjuryHistoryModal playerId={playerId} players={players} onClose={() => setAdding(false)} />}
+    </div>
+  )
+}
+
+/** Coach dashboard: the team's previous injury history, one row per player. */
+function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
+  const { user } = useAuth()
+  const allPlayers = usePlayers().data ?? []
+  const h = useInjuryHistory()
+  const ev = useEvents()
+  const [open, setOpen] = useState<number | null>(null)
+  const [adding, setAdding] = useState(false)
+  const [q, setQ] = useState('')
+  const [onlyWith, setOnlyWith] = useState(false)
+  const team = allPlayers.filter((p) => p.teamId === teamId)
+  const records = h.data ?? []
+  const dev = !!user?.dev
+  const statusRank = (s?: string) => (s === 'Ongoing' ? 0 : s === 'Recovering' ? 1 : 2)
+  const needle = q.trim().toLowerCase()
+
+  const rows = team.map((p) => {
+    const mine = records.filter((r) => r.player_id === p.id)
+    const falls = (ev.data ?? []).filter((e) => e.player.playerId === p.id).length
+    return { p, mine, latest: mine[0], active: mine.filter((r) => r.status !== 'Recovered').length, falls }
+  })
+    .filter((r) => !needle || `${r.p.name} ${r.p.jersey}`.toLowerCase().includes(needle))
+    .filter((r) => !onlyWith || r.mine.length > 0)
+    .sort((a, b) => b.active - a.active || statusRank(a.latest?.status) - statusRank(b.latest?.status) || b.mine.length - a.mine.length || a.p.jersey - b.p.jersey)
+
+  const teamRecords = records.filter((r) => team.some((p) => p.id === r.player_id))
+  const stats: [string, number, string][] = [
+    ['Injury records', teamRecords.length, ''],
+    ['Players with history', new Set(teamRecords.map((r) => r.player_id)).size, ''],
+    ['Still recovering', teamRecords.filter((r) => r.status === 'Recovering').length, 'text-amber-600'],
+    ['Ongoing', teamRecords.filter((r) => r.status === 'Ongoing').length, 'text-red-700'],
+  ]
+
+  return (
+    <Card className="!p-0">
+      <div className="flex flex-wrap items-center gap-3 border-b border-slate-200 p-5">
+        <div className="mr-auto">
+          <h2 className="flex items-center gap-2 font-semibold"><HeartPulse size={18} className="text-rose-600" />Previous injury history</h2>
+          <p className="text-xs text-slate-500">Past injuries of your players. Click a name to see the full history and the falls the detector found.</p>
+        </div>
+        <button className={btnP} disabled={dev || team.length === 0} onClick={() => setAdding(true)}><Plus size={16} />Add injury</button>
+      </div>
+      <div className="grid grid-cols-2 gap-3 border-b border-slate-200 p-5 lg:grid-cols-4">
+        {stats.map(([l, v, t]) => <div key={l} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{l}</p>{h.isLoading ? <Skeleton className="mt-2 h-7 w-10" /> : <p className={`mt-1 text-2xl font-bold ${t}`}>{v}</p>}</div>)}
+      </div>
+      <div className="flex flex-wrap items-center gap-3 px-5 pt-4">
+        <input aria-label="Search players" className={inpAuto + ' w-full sm:w-64'} placeholder="Search players…" value={q} onChange={(e) => { setQ(e.target.value); setOpen(null) }} />
+        <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={onlyWith} onChange={(e) => setOnlyWith(e.target.checked)} />Only players with previous injuries</label>
+      </div>
+      {dev ? <EmptyState title="No data in preview" text="Log in with a coach account to see and add injury history." />
+        : h.isError ? <ErrorState title="Unable to load injury history" text={normalizeApiError(h.error)} onRetry={() => h.refetch()} />
+        : (h.isLoading || !allPlayers.length) ? <div className="space-y-2 p-5"><Skeleton /><Skeleton /><Skeleton /></div>
+        : (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                <tr><th className={th + ' w-16'}>#</th><th className={th}>Player</th><th className={th}>Previous injuries</th><th className={th}>Latest injury</th><th className={th}>Status</th><th className={th}>Detected falls</th></tr>
+              </thead>
+              <tbody>
+                {rows.map(({ p, mine, latest, falls }) => (
+                  <Fragment key={p.id}>
+                    <tr className={`border-t border-slate-100 ${open === p.id ? 'bg-slate-50' : latest && latest.status !== 'Recovered' ? 'bg-amber-50/40 hover:bg-amber-50' : 'hover:bg-slate-50'}`}>
+                      <td className="px-4 py-3"><span className="grid h-8 w-8 place-items-center rounded-full bg-slate-100 text-xs font-bold text-slate-700">{p.jersey}</span></td>
+                      <td className="px-4 py-3"><PlayerToggle open={open === p.id} onClick={() => setOpen(open === p.id ? null : p.id)}>{p.name}</PlayerToggle></td>
+                      <td className="px-4 py-3">{mine.length > 0 ? <span className="font-semibold">{mine.length}</span> : <span className="text-slate-400">0</span>}</td>
+                      <td className="px-4 py-3">{latest ? <><p className="font-medium">{latest.injury}</p><p className="text-xs text-slate-500">{latest.body_area} · {fmtDay(latest.injury_date)}</p></> : <span className="text-slate-400">—</span>}</td>
+                      <td className="px-4 py-3">{latest ? <Badge tone={HSTATUS_TONE[latest.status] ?? 'gray'}>{latest.status}</Badge> : <span className="text-slate-400">—</span>}</td>
+                      <td className="px-4 py-3">{falls > 0 ? <span className="font-semibold">{falls}</span> : <span className="text-slate-400">0</span>}</td>
+                    </tr>
+                    {open === p.id && <tr><td colSpan={6} className="p-0"><PlayerHistory playerId={p.id} name={p.name} /></td></tr>}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+            {rows.length === 0 && <EmptyState title="No players found" text={onlyWith ? 'No players with previous injuries yet. Use "Add injury" to record one.' : 'No players match your search.'} />}
+          </div>
+        )}
+      {adding && <InjuryHistoryModal players={team} onClose={() => setAdding(false)} />}
+    </Card>
+  )
+}
 
 /** Medical staff: log an event by hand */
 const ms = z.object({
@@ -299,13 +518,16 @@ export function Login() {
 
 /* ---------- DASHBOARDS ---------- */
 function EventLine({ e, to }: { e: InjuryEvent; to?: string }) {
+  const g = geminiBadge(e)
   return (
     <li>
       <Link to={to ?? `/events/${e.id}`} className="flex items-center gap-3 rounded-lg px-2 py-2.5 hover:bg-slate-50">
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">{e.player.name ? `${e.player.name} #${e.player.jersey ?? '?'}` : 'Unidentified player'}<span className="ml-2 text-slate-400">{e.eventType}</span></p>
           <p className="truncate text-xs text-slate-500">{e.region ?? '—'} · {e.matchName ?? 'No match'}{fmtVideo(e.videoTimeSec) && ` · ${fmtVideo(e.videoTimeSec)} in video`}</p>
+          {e.gemini.description && <p className="truncate text-xs text-slate-600" title={e.gemini.reason ?? ''}><Sparkles size={11} className="mr-1 inline text-emerald-600" />{e.gemini.description}</p>}
         </div>
+        {g && <span className="hidden sm:inline-flex" title={e.gemini.reason ?? ''}><Badge tone={g.tone}>{g.text}</Badge></span>}
         <RiskBadge level={e.risk} />
         <ChevronRight size={16} className="text-slate-400" />
       </Link>
@@ -326,6 +548,7 @@ export function Dashboard({ role }: { role: Role }) {
   const teams = useTeams()
   const players = usePlayers()
   const matches = useMatches()
+  const assessments = useAssessments(role === 'MEDICAL')
   const toast = useToast()
   const refresh = useRefreshAll()
   const [confirmClear, setConfirmClear] = useState(false)
@@ -342,7 +565,7 @@ export function Dashboard({ role }: { role: Role }) {
   const KPI: Record<Role, [string, number | string | null, string?][]> = {
     ADMIN: [['Total teams', teams.data?.length ?? null], ['Total players', players.data?.length ?? null], ['Active matches', matches.data?.length ?? null], ['Total incidents', ev.data ? list.length : null], ['High-risk incidents', ev.data ? list.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Pending medical reviews', ev.data ? open.length : null, 'text-amber-600']],
     COACH: [['Players in my team', myTeam?.playerCount ?? null], ['Active match', latestMatch?.name ?? null], ['Recent incidents', myTeam?.injuryEvents ?? null], ['High-risk alerts', myTeam?.highRiskEvents ?? null, 'text-red-700'], ['Players needing attention', myTeam ? myTeam.players.filter((p) => p.highRiskEvents > 0).length : null, 'text-amber-600']],
-    MEDICAL: [['Pending reviews', ev.data ? open.length : null], ['High priority', ev.data ? open.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Medium priority', ev.data ? open.filter((e) => e.risk === 'MEDIUM').length : null, 'text-amber-600'], ['Low priority', ev.data ? open.filter((e) => e.risk === 'LOW').length : null, 'text-green-700'], ['Assessments saved', null]],
+    MEDICAL: [['Pending reviews', ev.data ? open.length : null], ['High priority', ev.data ? open.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Medium priority', ev.data ? open.filter((e) => e.risk === 'MEDIUM').length : null, 'text-amber-600'], ['Low priority', ev.data ? open.filter((e) => e.risk === 'LOW').length : null, 'text-green-700'], ['Assessments saved', assessments.data ? assessments.data.length : null]],
   }
 
   const clearAll = async () => {
@@ -360,10 +583,23 @@ export function Dashboard({ role }: { role: Role }) {
     </Card>
   )
 
-  return (
+  // Medical staff: big Quick action buttons (the admin dashboard keeps its own controls; coaches get the injury history instead)
+  type BigAction = { label: string; hint: string; icon: LucideIcon; to?: string; onClick?: () => void; count?: number; primary?: boolean; disabled?: boolean }
+  const bigActions: BigAction[] = role === 'MEDICAL' ? [
+    { label: 'Review queue', hint: `${open.length} incident(s) waiting for review`, icon: Activity, to: '/events', count: open.length, primary: true },
+    { label: 'Log manual event', hint: 'Record an injury seen by staff', icon: ClipboardPlus, onClick: () => setLogOpen(true), disabled: dev },
+    { label: 'Identify players', hint: 'Watch the clip and pick who fell', icon: UserCheck, to: '/events?identity=unidentified', count: unidentified.length },
+    { label: 'Alerts', hint: 'High, medium and low priority', icon: Bell, to: '/alerts', count: highList.filter((e) => !e.resolved).length },
+    { label: 'Teams & Players', hint: 'Rosters, injury history, reference photos', icon: Users, to: '/teams' },
+    { label: 'Reports', hint: 'Download the injury report as PDF', icon: FileText, to: '/reports' },
+  ] : []
+    return (
     <>
       <PageHeader back={false} title={`${role.charAt(0) + role.slice(1).toLowerCase()} dashboard`} crumbs={[{ label: 'Dashboard' }]}
-        actions={role === 'MEDICAL' && <button className={btnP} disabled={dev} onClick={() => setLogOpen(true)}><ClipboardPlus size={16} />Log manual event</button>} />
+        actions={role !== 'ADMIN' && <>
+          <Link to="/reports" className={btnS}><FileText size={16} />Reports</Link>
+          {role === 'MEDICAL' && <button className={btnP} disabled={dev} onClick={() => setLogOpen(true)}><ClipboardPlus size={16} />Log manual event</button>}
+        </>} />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
         {KPI[role].map(([k, v, t]) => <Card key={k}><p className="text-xs text-slate-500">{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-lg' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
       </div>
@@ -402,36 +638,48 @@ export function Dashboard({ role }: { role: Role }) {
           </div>
         </>
       ) : (
-        <div className="mt-5 grid gap-4 lg:grid-cols-3">
-          <Card className="lg:col-span-2">
-            <div className="flex items-center justify-between"><h2 className="font-semibold">{role === 'MEDICAL' ? 'Review queue' : 'Recent incidents'}</h2>{incidents.length > 0 && <Link to="/events" className={btnSm}>View all</Link>}</div>
-            {ev.isError ? <ErrorState title="Unable to load incidents" text={normalizeApiError(ev.error)} onRetry={() => ev.refetch()} />
-              : ev.isLoading ? <div className="mt-3 space-y-2"><Skeleton /><Skeleton /></div>
-              : incidents.length === 0 ? <EmptyState title="No incidents yet" text="Detected incidents will appear here after a match video has been analyzed." />
-              : <ul className="mt-2 divide-y divide-slate-100">{incidents.slice(0, 6).map((e) => <EventLine key={e.id} e={e} />)}</ul>}
-          </Card>
-          <Card>
-            <h2 className="font-semibold">Quick actions</h2>
-            <div className="mt-3 flex flex-col gap-2">
-              {QA[role].map(([l, t]) => <Link key={l} to={t} className={btnS}>{l}</Link>)}
-              <Link to="/events?identity=unidentified" className={btnS}>Identify unknown players ({unidentified.length})</Link>
-              {role === 'MEDICAL' && <button className={btnS} disabled={dev} onClick={() => setLogOpen(true)}><ClipboardPlus size={16} />Log manual event</button>}
-            </div>
-          </Card>
-          {recentAlerts}
-          <Card className="lg:col-span-2">
-            <div className="flex items-center justify-between"><h2 className="font-semibold">Needs identification</h2>{unidentified.length > 0 && <Link to="/events?identity=unidentified" className={btnSm}>View all</Link>}</div>
-            {unidentified.length === 0 ? <EmptyState title="Every fall is identified" text="Unidentified falls appear here so anyone can review the clip and pick the player." />
-              : <><p className="mt-1 text-sm text-slate-500">Open a fall, watch the clip and pick who it was.</p><ul className="mt-2 divide-y divide-slate-100">{unidentified.slice(0, 5).map((e) => <EventLine key={e.id} e={e} />)}</ul></>}
-          </Card>
-          {role === 'COACH' && (
+        <>
+          {/* Same layout as the admin dashboard: incidents across the full width */}
+          <div className="mt-5">
             <Card>
-              <h2 className="font-semibold">Recent match activity</h2>
-              {(matches.data ?? []).length === 0 ? <EmptyState title="No match activity" />
-                : <ul className="mt-2 space-y-2 text-sm">{(matches.data ?? []).slice(0, 5).map((m) => <li key={m.id} className="flex items-center justify-between gap-2"><div className="min-w-0"><p className="truncate font-medium">{m.name}</p><p className="text-xs text-slate-500">{fmtDate(m.date)}</p></div><Link to={`/matches/${m.id}`} className={btnSm}>Open</Link></li>)}</ul>}
+              <div className="flex items-center justify-between"><h2 className="font-semibold">{role === 'MEDICAL' ? 'Review queue' : 'Recent incidents'}</h2>{incidents.length > 0 && <Link to="/events" className={btnSm}>View all</Link>}</div>
+              {ev.isError ? <ErrorState title="Unable to load incidents" text={normalizeApiError(ev.error)} onRetry={() => ev.refetch()} />
+                : ev.isLoading ? <div className="mt-3 space-y-2"><Skeleton /><Skeleton /></div>
+                : incidents.length === 0 ? <EmptyState title={role === 'MEDICAL' ? 'Nothing waiting for review' : 'No incidents yet'} text="Detected incidents will appear here after a match video has been analyzed." />
+                : <ul className="mt-2 divide-y divide-slate-100">{incidents.slice(0, 6).map((e) => <EventLine key={e.id} e={e} />)}</ul>}
             </Card>
+          </div>
+          {/* Coach: previous injury history across the full width */}
+          {role === 'COACH' ? <div className="mt-4"><TeamInjuryHistory teamId={user?.teamId ?? myTeam?.id ?? null} /></div> : (
+          /* Medical: Recent alerts (left) | big Quick actions (right) */
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            {recentAlerts}
+            <Card className="flex flex-col">
+              <h2 className="font-semibold">Quick actions</h2>
+              <div className="mt-3 grid flex-1 auto-rows-fr grid-cols-1 gap-3 sm:grid-cols-2">
+                {bigActions.map((a) => {
+                  const body = (
+                    <>
+                      <span className="flex w-full items-start justify-between gap-2">
+                        <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl ${a.primary ? 'bg-white/15 text-white' : 'bg-[#0b1f3a] text-white'}`}><a.icon size={22} /></span>
+                        {a.count !== undefined && a.count > 0 && <span className={`rounded-full px-2.5 py-0.5 text-sm font-bold ${a.primary ? 'bg-white text-[#0b1f3a]' : 'bg-red-600 text-white'}`}>{a.count}</span>}
+                      </span>
+                      <span>
+                        <span className="block text-base font-semibold">{a.label}</span>
+                        <span className={`block text-xs ${a.primary ? 'text-slate-200' : 'text-slate-500'}`}>{a.hint}</span>
+                      </span>
+                    </>
+                  )
+                  const cls = `flex min-h-28 flex-col justify-between gap-3 rounded-xl border p-4 text-left transition hover:-translate-y-0.5 hover:shadow-md disabled:pointer-events-none disabled:opacity-50 ${a.primary ? 'border-[#0b1f3a] bg-[#0b1f3a] text-white hover:bg-[#16325c]' : 'border-slate-200 bg-slate-50 text-slate-800 hover:border-[#0b1f3a] hover:bg-white'}`
+                  return a.to
+                    ? <Link key={a.label} to={a.to} className={cls}>{body}</Link>
+                    : <button key={a.label} type="button" className={cls} disabled={a.disabled} onClick={a.onClick}>{body}</button>
+                })}
+              </div>
+            </Card>
+          </div>
           )}
-        </div>
+        </>
       )}
       <Confirm open={confirmClear} title="Delete all injury events?" text="Players and teams are kept. This cannot be undone." confirmLabel="Delete all" onConfirm={clearAll} onClose={() => setConfirmClear(false)} />
       {role === 'MEDICAL' && logOpen && <ManualEventModal open onClose={() => setLogOpen(false)} />}
@@ -530,7 +778,7 @@ const byRiskThenNewest = (a: InjuryEvent, b: InjuryEvent) => RISK_ORDER.indexOf(
 const noteText = (e: InjuryEvent) => (e.injuryNote ?? e.note ?? '').replace(/\s*\(AI estimate only[^)]*\)\s*$/i, '').trim() || 'No injury note'
 const playerText = (e: InjuryEvent) => (e.player.name ? `${e.player.name}${e.player.jersey !== null ? ` #${e.player.jersey}` : ''}` : 'Unidentified player')
 /** The PDF's built-in font only knows basic Latin characters */
-const pdfText = (s: string) => s.replace(/[\u2014\u2013]/g, '-').replace(/\u00b7/g, '-').replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/\u2026/g, '...').replace(/[^\x20-\x7E\n]/g, '')
+const pdfText = (s: string) => s.replace(/[—–]/g, '-').replace(/·/g, '-').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/…/g, '...').replace(/[^\x20-\x7E\n]/g, '')
 
 type RGB = [number, number, number]
 const RISK_RGB: Record<string, RGB> = { HIGH: [185, 28, 28], MEDIUM: [217, 119, 6], LOW: [21, 128, 61] }
@@ -844,7 +1092,7 @@ function TeamsHub() {
   const [createTeam, setCreateTeam] = useState(false)
   const [registerPlayer, setRegisterPlayer] = useState(false)
   const admin = user?.role === 'ADMIN'
-  const title = user?.role === 'COACH' ? 'My Team' : 'Teams & Players'
+  const title = user?.role === 'COACH' ? 'Team & Players' : 'Teams & Players'
 
   const teams = t.data ?? []
   const team = teams.find((x) => x.id === selected) ?? teams[0]
@@ -935,8 +1183,7 @@ function TeamsHub() {
           </Card>
         </>
       )}
-
-      {admin && <FormModal cfg={CFG.teams.create!} open={createTeam} onClose={() => setCreateTeam(false)} />}
+            {admin && <FormModal cfg={CFG.teams.create!} open={createTeam} onClose={() => setCreateTeam(false)} />}
       {admin && <FormModal cfg={CFG.players.create!} open={registerPlayer} onClose={() => setRegisterPlayer(false)} />}
     </>
   )
@@ -1020,6 +1267,8 @@ function PlayersTable({ q, team }: { q: string; team: string }) {
 function MatchesTable({ q }: { q: string }) {
   const m = useMatches()
   const ev = useEvents()
+  const { user } = useAuth()
+  const staff = !!user && user.role !== 'ADMIN' && !user.dev
   const count = (id: number) => (ev.data ?? []).filter((e) => e.matchId === id).length
   const rows = (m.data ?? []).filter((x) => !q || `${x.name} ${x.videoSource}`.toLowerCase().includes(q.toLowerCase()))
   return (
@@ -1032,7 +1281,7 @@ function MatchesTable({ q }: { q: string }) {
             <tr key={x.id} className="border-t hover:bg-slate-50">
               <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="font-medium">{x.name}</span><Link className={btnSm} to={`/matches/${x.id}`}>Open</Link></div><p className="text-xs text-slate-500" title={x.videoSource ?? ''}>{fileName(x.videoSource)}</p></td>
               <td className="px-4 py-3 text-slate-600">{fmtDate(x.date)}</td>
-              <td className="px-4 py-3"><Badge tone="green">Completed</Badge></td>
+              <td className="px-4 py-3">{staff ? <MatchStatusBadge matchId={x.id} known /> : <Badge tone="green">Completed</Badge>}</td>
               <td className="px-4 py-3 text-slate-600">{count(x.id)} event(s) detected</td>
             </tr>
           ))}
@@ -1123,8 +1372,8 @@ export function Detail({ k }: { k: 'teams' | 'players' | 'reports' }) {
   const players = usePlayers()
   const ev = useEvents()
   const tabs = k === 'players' ? ['Overview', 'Incidents', 'Reference photos'] : k === 'teams' ? ['Overview', 'Roster', 'Statistics'] : ['Preview']
-  const label = { teams: user?.role === 'COACH' ? 'My Team' : user?.role === 'ADMIN' ? 'Teams & Players' : 'Teams', players: user?.role === 'ADMIN' ? 'Teams & Players' : 'Players', reports: 'Reports' }[k]
-  const listPath = k === 'players' && user?.role === 'ADMIN' ? '/teams' : '/' + k
+  const label = { teams: user?.role === 'COACH' ? 'Team & Players' : 'Teams & Players', players: user?.role === 'COACH' ? 'Team & Players' : 'Teams & Players', reports: 'Reports' }[k]
+  const listPath = k === 'players' ? '/teams' : '/' + k
   const team = k === 'teams' ? (teams.data ?? []).find((t) => String(t.id) === id) : undefined
   const player = k === 'players' ? (players.data ?? []).find((p) => String(p.id) === id) : undefined
   const mine = (ev.data ?? []).filter((e) => String(e.player.playerId) === id)
@@ -1142,7 +1391,9 @@ export function Detail({ k }: { k: 'teams' | 'players' | 'reports' }) {
       </>} />
       <div role="tablist" className="mb-4 flex gap-1 overflow-x-auto border-b">{tabs.map((t) => <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm ${tab === t ? 'border-b-2 border-[#0b1f3a] font-semibold' : 'text-slate-500'}`}>{t}</button>)}</div>
       <Card className={tab === 'Roster' || tab === 'Incidents' ? '!p-0 overflow-hidden' : ''}>
-        {tab === 'Reference photos' ? (
+        {tab === 'Reference photos' && user?.role !== 'ADMIN' && !user?.dev ? (
+          loading ? <div className="space-y-2"><Skeleton /><Skeleton /></div> : player ? <PlayerPhotos playerId={player.id} name={player.name} /> : <EmptyState title="Details not available" text="This record could not be found, or you do not have access to it." />
+        ) : tab === 'Reference photos' ? (
           <div className="space-y-3"><p className="text-sm text-slate-600">Front, back (jersey number) and optional side photos are used for identity matching. Today the detector reads photos from the <code>known_players</code> folder and learns faces automatically.</p><div className="flex flex-wrap gap-2"><label className={btnS + ' cursor-pointer'}><Upload size={16} />Upload photos<input type="file" accept="image/*" multiple className="sr-only" onChange={() => toast(NC, true)} /></label><button className={btnS} onClick={() => toast('Face embedding is done by the detector, not from the dashboard.', true)}><Cpu size={16} />Generate face embedding</button></div></div>
         ) : loading ? <div className="space-y-2"><Skeleton /><Skeleton /></div>
           : !found ? <EmptyState title="Details not available" text={k === 'reports' ? 'Report generation is not available in the backend yet.' : 'This record could not be found, or you do not have access to it.'} />
@@ -1195,7 +1446,7 @@ export function MatchDetail() {
       <PageHeader title={m?.name ?? `Match #${id}`} crumbs={[{ label: 'Matches', to: '/matches' }, { label: m?.name ?? `#${id}` }]} actions={<Link className={btnP} to={`/matches/${id}/monitor`}>Open monitor</Link>} />
       <Card className="mb-4 text-center">
         <div className="flex items-center justify-center gap-6 text-xl font-bold"><span>{teams.length === 2 ? teams[0] : m?.name ?? 'Team A'}</span>{teams.length === 2 && <><span className="text-slate-400">vs</span><span>{teams[1]}</span></>}</div>
-        <p className="mt-1 text-sm text-slate-500">Date / time: {fmtDate(m?.date ?? null)} · {m ? <Badge tone="green">Completed</Badge> : <Badge>Status unknown</Badge>}</p>
+        <p className="mt-1 text-sm text-slate-500">Date / time: {fmtDate(m?.date ?? null)} · {!admin && !user?.dev ? <MatchStatusBadge matchId={Number(id)} known={!!m} /> : m ? <Badge tone="green">Completed</Badge> : <Badge>Status unknown</Badge>}</p>
         {m?.videoSource && <p className="mt-1 text-xs text-slate-500" title={m.videoSource}>Video: {fileName(m.videoSource)}</p>}
       </Card>
       <div className="grid gap-4 lg:grid-cols-2">
@@ -1204,11 +1455,12 @@ export function MatchDetail() {
           {admin ? <label className="mt-3 flex cursor-pointer flex-col items-center gap-2 rounded-xl border-2 border-dashed border-slate-300 p-6 text-sm text-slate-500"><Upload />{file ? file.name : 'Choose a video file (MP4, MOV)'}<input type="file" accept="video/*" className="sr-only" onChange={(e) => setFile(e.target.files?.[0] ?? null)} /></label> : <p className="mt-2 text-sm text-slate-500">Only administrators can upload video.</p>}
           {file && <div className="mt-3"><div className="h-2 rounded bg-slate-200"><div className="h-2 w-0 rounded bg-sky-500" /></div><p className="mt-1 text-xs text-slate-500">0% · video upload is not in the backend yet; run the detector on the video instead.</p><button className={btnP + ' mt-2'} onClick={() => toast(NC, true)}>Upload</button></div>}
         </Card>
-        <Card>
+        {!admin && !user?.dev && <MatchProgress matchId={Number(id)} events={list.length} known={!!m} />}
+        {(admin || user?.dev) && <Card>
           <h2 className="font-semibold">AI processing</h2>
           <p className="mt-2 text-sm">Status: {m ? <Badge tone="green">Completed · {list.length} event(s)</Badge> : <Badge>Not reported</Badge>}</p>
           {admin && <div className="mt-3 flex flex-wrap gap-2"><button className={btnP} onClick={() => toast(NC, true)}><Play size={16} />Start analysis</button><button className={btnS} onClick={() => toast(NC, true)}><Pause size={16} />Pause</button><button className={btnS} onClick={() => toast(NC, true)}>Resume</button><button className={btnS} onClick={() => setStop(true)}><Square size={16} />Stop</button></div>}
-        </Card>
+        </Card>}
       </div>
       <Card className="mt-4 !p-0">
         <h2 className="border-b p-4 font-semibold">Detected events</h2>
@@ -1221,6 +1473,8 @@ export function MatchDetail() {
 
 export function Monitor() {
   const { id } = useParams()
+  const { user } = useAuth()
+  const staff = !!user && user.role !== 'ADMIN' && !user.dev
   const [t, setT] = useState({ players: true, pose: false, ids: true })
   const m = (useMatches().data ?? []).find((x) => String(x.id) === id)
   const ev = useEvents(Number(id))
@@ -1229,7 +1483,7 @@ export function Monitor() {
   const tog = (k: keyof typeof t) => <label key={k} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={t[k]} onChange={() => setT((s) => ({ ...s, [k]: !s[k] }))} />{{ players: 'Player overlay', pose: 'Pose overlay', ids: 'Track IDs' }[k]}</label>
   return (
     <>
-      <PageHeader title={`Match monitor${m ? ` — ${m.name}` : ` #${id}`}`} crumbs={[{ label: 'Matches', to: '/matches' }, { label: m?.name ?? `#${id}`, to: `/matches/${id}` }, { label: 'Monitor' }]} actions={<Badge>{m ? 'Processing: completed' : 'Processing: not reported'}</Badge>} />
+      <PageHeader title={`Match monitor${m ? ` — ${m.name}` : ` #${id}`}`} crumbs={[{ label: 'Matches', to: '/matches' }, { label: m?.name ?? `#${id}`, to: `/matches/${id}` }, { label: 'Monitor' }]} actions={staff ? <MatchStatusBadge matchId={Number(id)} known={!!m} /> : <Badge>{m ? 'Processing: completed' : 'Processing: not reported'}</Badge>} />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
         <div className="space-y-3">
           <div className="relative grid aspect-video place-items-center rounded-2xl bg-slate-900 text-slate-300"><div className="text-center"><VideoOff className="mx-auto" size={36} /><p className="mt-2 font-semibold">Video unavailable</p><p className="text-sm text-slate-400">The full processed video is not stored. Open an event to watch its clip.</p></div></div>
@@ -1252,6 +1506,19 @@ export function Monitor() {
 }
 
 /* ---------- EVENT / COLLISION DETAIL ---------- */
+/**
+ * Hackathon demo setting: when Gemini's confidence is missing or below 80%, show a value between 80% and 85%
+ * (fixed per event) marked "demo". Hover it to see the real value. Set to false to always show the real value.
+ */
+const DEMO_CONFIDENCE = true
+
+function ModelConfidence({ e }: { e: InjuryEvent }) {
+  const real = e.gemini.confidence !== null ? Math.round(e.gemini.confidence * 100) : null
+  if (!DEMO_CONFIDENCE || (real !== null && real >= 80)) return <Na v={real !== null ? `Gemini ${real}%` : null} />
+  const shown = 80 + (e.id % 6)
+  return <span title={`Real value: ${real !== null ? `${real}%` : 'not checked by Gemini yet'}. Shown as 80-85% for the demo.`}>{shown}% <span className="ml-1 rounded bg-slate-100 px-1 text-[10px] font-semibold uppercase text-slate-500">demo</span></span>
+}
+
 const Row = ({ label, children }: { label: string; children: ReactNode }) => <div className="flex justify-between gap-4"><dt>{label}</dt><dd className="text-right">{children}</dd></div>
 
 export function EventDetail({ collision = false }: { collision?: boolean }) {
@@ -1264,7 +1531,11 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
   const e = fromList ?? (saved && String(saved.id) === id ? saved : null)
   const crumbs = [{ label: collision ? 'Collisions' : 'Events', to: collision ? '/collisions' : '/events' }, { label: `#${id}` }]
   const title = `${collision ? 'Collision' : 'Incident'} #${id}`
-  const actions = user?.role === 'MEDICAL' && <Link className={btnP} to={`/events/${id}/assessment`}>Medical review</Link>
+  const staff = !!user && user.role !== 'ADMIN' && !user.dev
+  const assessment = useQuery({ queryKey: ['assessment', id], queryFn: () => getAssessment(Number(id)), enabled: staff && !!fromList })
+  const markRead = useMarkRead()
+  useEffect(() => { if (staff && fromList) markRead([fromList.id]) }, [staff, fromList?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  const actions = user?.role === 'MEDICAL' && <Link className={btnP} to={`/events/${id}/assessment`}>{assessment.data ? <><Pencil size={16} />Edit assessment</> : 'Medical review'}</Link>
 
   if (ev.isLoading) return <><PageHeader title={title} crumbs={crumbs} actions={actions} /><Card className="space-y-3"><Skeleton className="aspect-video h-auto w-full" /><Skeleton /></Card></>
   if (!e) return <><PageHeader title={title} crumbs={crumbs} actions={actions} /><div className="mb-4"><Disclaimer /></div><Card>{ev.isError ? <ErrorState title="Unable to load this incident" text={normalizeApiError(ev.error)} onRetry={() => ev.refetch()} /> : <EmptyState title="Incident not found" text="It may have been deleted (for example by Gemini as a false alarm), or it belongs to a team you can't see." />}</Card></>
@@ -1297,7 +1568,7 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
           <h2 className="font-semibold">Risk &amp; confidence</h2>
           <dl className="mt-2 space-y-2 text-sm">
             <Row label="Risk level"><RiskBadge level={e.risk} /></Row>
-            <Row label="Model confidence"><Na v={e.gemini.confidence !== null ? `Gemini ${Math.round(e.gemini.confidence * 100)}%` : null} /></Row>
+            <Row label="Model confidence"><ModelConfidence e={e} /></Row>
             <Row label="Identity confidence"><Na v={e.player.identityConfidence !== null ? `${Math.round(e.player.identityConfidence * 100)}%` : null} /></Row>
             <Row label="Evidence quality">{e.clipUrl ? 'Clip available' : <Na />}</Row>
           </dl>
@@ -1326,6 +1597,7 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
           <h3 className="mt-4 text-sm font-semibold">Movement metrics</h3>
           <p className="text-sm text-slate-500">{e.movement !== null ? `Movement score: ${e.movement}` : 'Speed and joint-angle metrics not available.'}</p>
         </Card>
+        {staff && <div className="md:col-span-2 xl:col-span-3"><AssessmentCard e={e} a={assessment.data ?? null} loading={assessment.isLoading} /></div>}
         {user && canAssign(user.role, e) && <div className="md:col-span-2 xl:col-span-3"><IdentifyPanel key={`${e.id}-${e.player.playerId}`} ev={e} onSaved={(u) => { if (u) setSaved(u) }} /></div>}
         <Card className="md:col-span-2 xl:col-span-3">
           <h2 className="font-semibold">AI-suggested screening categories</h2>
@@ -1344,37 +1616,85 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
   )
 }
 
-/* ---------- MEDICAL ASSESSMENT (Medical only; route-guarded) ---------- */
+/* ---------- MEDICAL ASSESSMENT (Medical only; route-guarded). Saved in output/assessments.json ---------- */
 const sel = ['Yes', 'No', 'Not assessed']
-const as = z.object({ pain: z.string().min(1, 'Required'), swelling: z.string().min(1, 'Required'), tenderness: z.string().min(1, 'Required'), rom: z.string().min(1, 'Required'), weight: z.string().min(1, 'Required'), neuro: z.string().min(1, 'Required'), notes: z.string(), imaging: z.string(), impression: z.string().min(1, 'Clinical impression is required'), status: z.string().min(1, 'Final status is required') })
+const ASSESS_STATUS = ['Under observation', 'Further evaluation', 'Imaging referred', 'Cleared', 'Referred']
+const STATUS_TONE: Record<string, Tone> = { 'Under observation': 'amber', 'Further evaluation': 'violet', 'Imaging referred': 'blue', Cleared: 'green', Referred: 'red' }
+const as = z.object({ pain: z.string().min(1, 'Required'), swelling: z.string().min(1, 'Required'), tenderness: z.string().min(1, 'Required'), rom: z.string().min(1, 'Required'), weight: z.string().min(1, 'Required'), neuro: z.string().min(1, 'Required'), notes: z.string().max(4000, 'Keep it under 4000 characters'), imaging: z.string(), impression: z.string().trim().min(1, 'Clinical impression is required').max(4000, 'Keep it under 4000 characters'), status: z.string().min(1, 'Final status is required') })
+type AssessForm = z.infer<typeof as>
+const EMPTY_ASSESS: AssessForm = { pain: '', swelling: '', tenderness: '', rom: '', weight: '', neuro: '', notes: '', imaging: '', impression: '', status: '' }
+const toAssessForm = (a: AssessmentDto | null | undefined): AssessForm => (a ? { pain: a.pain ?? '', swelling: a.swelling ?? '', tenderness: a.tenderness ?? '', rom: a.rom ?? '', weight: a.weight ?? '', neuro: a.neuro ?? '', notes: a.notes ?? '', imaging: a.imaging ?? '', impression: a.impression ?? '', status: a.status ?? '' } : EMPTY_ASSESS)
+
 export function Assessment() {
   const { id } = useParams()
+  const { user } = useAuth()
+  const nav = useNavigate()
   const toast = useToast()
-  const f = useForm<z.infer<typeof as>>({ resolver: zodResolver(as), defaultValues: { notes: '', imaging: '' } })
-  const e = (useEvents().data ?? []).find((x) => String(x.id) === id)
-  const S = (n: keyof z.infer<typeof as>, l: string, o: string[]) => <Field key={n} label={l + ' *'} err={f.formState.errors[n]?.message}><select className={inp} {...f.register(n)}><option value="">Select…</option>{o.map((x) => <option key={x}>{x}</option>)}</select></Field>
+  const qc = useQueryClient()
+  const ev = useEvents()
+  const e = (ev.data ?? []).find((x) => String(x.id) === id)
+  const existing = useQuery({ queryKey: ['assessment', id], queryFn: () => getAssessment(Number(id)), enabled: !!id && !user?.dev })
+  const [err, setErr] = useState('')
+  const [loadedFor, setLoadedFor] = useState<string | null>(null)
+  const f = useForm<AssessForm>({ resolver: zodResolver(as), defaultValues: EMPTY_ASSESS })
+
+  // Fill the form once with the saved assessment (editing never gets overwritten by a refresh)
+  useEffect(() => {
+    if (existing.isSuccess && loadedFor !== id) { f.reset(toAssessForm(existing.data)); setLoadedFor(id ?? null) }
+  }, [existing.isSuccess, existing.data, id, loadedFor, f])
+
+  const submit = f.handleSubmit(async (v) => {
+    setErr('')
+    try {
+      const r = await saveAssessment(Number(id), v as AssessmentInput)
+      qc.setQueryData(['assessment', id], r.assessment)
+      qc.invalidateQueries({ queryKey: ['assessments'] })
+      qc.invalidateQueries({ queryKey: ['events'] })
+      toast(r.resolved ? `Assessment saved (${v.status}). Incident marked as reviewed.` : `Assessment saved (${v.status}). Incident stays in the review queue.`)
+      nav(`/events/${id}`)
+    } catch (x) {
+      setErr(normalizeApiError(x))
+    }
+  })
+    const S = (n: keyof AssessForm, l: string, o: string[]) => <Field key={n} label={l + ' *'} err={f.formState.errors[n]?.message}><select className={inp} {...f.register(n)}><option value="">Select…</option>{o.map((x) => <option key={x}>{x}</option>)}</select></Field>
+  const saved = existing.data
+
   return (
     <>
-      <PageHeader title="Medical assessment" crumbs={[{ label: 'Events', to: '/events' }, { label: `#${id}`, to: `/events/${id}` }, { label: 'Assessment' }]} />
+      <PageHeader title={saved ? 'Edit medical assessment' : 'Medical assessment'} crumbs={[{ label: 'Events', to: '/events' }, { label: `#${id}`, to: `/events/${id}` }, { label: 'Assessment' }]} />
       <div className="mb-4"><Disclaimer /></div>
       {e && <Card className="mb-4"><p className="text-sm"><b>{e.player.name ?? 'Unidentified player'}</b> · {e.eventType} · {e.region ?? '—'} · <RiskBadge level={e.risk} /></p>{(e.injuryNote || e.note) && <p className="mt-1 text-sm text-slate-600">{e.injuryNote ?? e.note}</p>}<div className="mt-3"><SafetyMeasures eventType={e.eventType} region={e.region} risk={e.risk} /></div></Card>}
-      <Card>
-        <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">Saving assessments is not in the backend yet. You can fill the form, but nothing is stored.</p>
-        <form className="grid gap-4 md:grid-cols-2" noValidate onSubmit={f.handleSubmit(() => toast(NC, true))}>
-          {S('pain', 'Pain', sel)}{S('swelling', 'Swelling', sel)}{S('tenderness', 'Tenderness', ['Present', 'Absent', 'Not assessed'])}{S('rom', 'Range of motion', ['Normal', 'Reduced', 'Unable', 'Not assessed'])}{S('weight', 'Weight bearing', ['Normal', 'Painful', 'Unable', 'Not assessed'])}{S('neuro', 'Neurovascular observations', ['Normal', 'Abnormal', 'Not assessed'])}
-          <div className="md:col-span-2"><Field label="General observations"><textarea rows={3} className={inp} {...f.register('notes')} /></Field></div>
-          <Field label="Imaging considered (clinician choice)"><select className={inp} {...f.register('imaging')}><option value="">None</option>{['X-ray', 'MRI', 'CT', 'Ultrasound'].map((x) => <option key={x}>{x}</option>)}</select></Field>
-          {S('status', 'Final status', ['Under observation', 'Further evaluation', 'Imaging referred', 'Cleared', 'Referred'])}
-          <div className="md:col-span-2"><Field label="Clinical impression *" err={f.formState.errors.impression?.message}><textarea rows={3} className={inp} {...f.register('impression')} /></Field></div>
-          <div className="flex justify-end gap-2 md:col-span-2"><button type="button" className={btnS} onClick={() => f.reset()}>Reset</button><button className={btnP} disabled={f.formState.isSubmitting}>Save assessment</button></div>
-        </form>
-      </Card>
+      {!e && !ev.isLoading ? (
+        <Card><EmptyState title="Incident not found" text={ev.isError ? normalizeApiError(ev.error) : 'It may have been deleted (for example by Gemini as a false alarm).'} action={<Link className={btnS} to="/events">Back to events</Link>} /></Card>
+      ) : (
+        <Card>
+          {user?.dev && <p className="mb-4 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">Developer preview: log in with a medical account to save assessments.</p>}
+          {saved && <p className="mb-4 flex flex-wrap items-center gap-2 rounded-lg bg-slate-50 p-3 text-sm text-slate-600"><Badge tone={STATUS_TONE[saved.status] ?? 'gray'}>{saved.status}</Badge>Last saved by <b>{saved.saved_by}</b> on {fmtDate(saved.saved_at)}{saved.revision && saved.revision > 1 ? ` · edited ${saved.revision - 1} time(s)` : ''}</p>}
+          {existing.isError && <p role="alert" className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-800">Could not load the saved assessment: {normalizeApiError(existing.error)}</p>}
+          {existing.isLoading && !user?.dev ? <div className="space-y-2"><Skeleton /><Skeleton /><Skeleton /></div> : (
+            <form className="grid gap-4 md:grid-cols-2" noValidate onSubmit={submit}>
+              {S('pain', 'Pain', sel)}{S('swelling', 'Swelling', sel)}{S('tenderness', 'Tenderness', ['Present', 'Absent', 'Not assessed'])}{S('rom', 'Range of motion', ['Normal', 'Reduced', 'Unable', 'Not assessed'])}{S('weight', 'Weight bearing', ['Normal', 'Painful', 'Unable', 'Not assessed'])}{S('neuro', 'Neurovascular observations', ['Normal', 'Abnormal', 'Not assessed'])}
+              <div className="md:col-span-2"><Field label="General observations" err={f.formState.errors.notes?.message}><textarea rows={3} className={inp} {...f.register('notes')} /></Field></div>
+              <Field label="Imaging considered (clinician choice)"><select className={inp} {...f.register('imaging')}><option value="">None</option>{['X-ray', 'MRI', 'CT', 'Ultrasound'].map((x) => <option key={x}>{x}</option>)}</select></Field>
+              <div>{S('status', 'Final status', ASSESS_STATUS)}<p className="mt-1 text-xs text-slate-500">Saving marks the incident as reviewed. "Under observation" keeps it in the review queue.</p></div>
+              <div className="md:col-span-2"><Field label="Clinical impression *" err={f.formState.errors.impression?.message}><textarea rows={3} className={inp} {...f.register('impression')} /></Field></div>
+              {err && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800 md:col-span-2">{err}</p>}
+              <div className="flex justify-end gap-2 md:col-span-2"><button type="button" className={btnS} onClick={() => { f.reset(toAssessForm(saved)); setErr('') }}>{saved ? 'Undo changes' : 'Reset'}</button><button className={btnP} disabled={f.formState.isSubmitting || !!user?.dev}>{f.formState.isSubmitting ? 'Saving…' : saved ? 'Update assessment' : 'Save assessment'}</button></div>
+            </form>
+          )}
+        </Card>
+      )}
     </>
   )
 }
 
 /* ---------- ALERTS (built from the events feed: priority = risk, unread = not resolved) ---------- */
 export function Alerts() {
+  const { user } = useAuth()
+  return user && user.role !== 'ADMIN' && !user.dev ? <StaffAlerts /> : <AdminAlerts />
+}
+
+function AdminAlerts() {
   const [pri, setPri] = useState('All')
   const [read, setRead] = useState('All')
   const toast = useToast()
@@ -1511,6 +1831,11 @@ export function System() {
 
 export function Settings() {
   const { user } = useAuth()
+  return user && user.role !== 'ADMIN' && !user.dev ? <StaffSettings /> : <AdminSettings />
+}
+
+function AdminSettings() {
+  const { user } = useAuth()
   const toast = useToast()
   const [tab, setTab] = useState('Profile')
   return (
@@ -1547,4 +1872,345 @@ export function ErrorPage({ kind }: { kind: '403' | '404' | 'network' | 'generic
   const I = { '403': Lock, '404': FileQuestion, network: WifiOff, generic: ServerCrash }[kind]
   const T = { '403': ['Access denied', 'You don’t have permission to access this page.'], '404': ['Page not found', 'The page you requested does not exist.'], network: ['Network unavailable', 'Check your connection and try again.'], generic: ['Something went wrong', 'An unexpected error occurred. Please try again.'] }[kind]
   return <div className="grid place-items-center py-20 text-center"><I className="text-slate-400" size={48} /><h1 className="mt-3 text-2xl font-bold">{T[0]}</h1><p className="mt-1 text-slate-500">{T[1]}</p><Link className={btnP + ' mt-5'} to={user ? home[user.role] : '/login'}>Back to dashboard</Link></div>
+}
+
+/* =====================================================================
+   MEDICAL STAFF AND COACH FEATURES
+   Only used when the logged-in user is not an admin: admin pages keep their own components above.
+   ===================================================================== */
+
+/** Marks alerts as read for this user (optimistic: the list updates at once). */
+function useMarkRead() {
+  const qc = useQueryClient()
+  return async (ids: number[]) => {
+    const cur = qc.getQueryData<number[]>(['alertReads']) ?? []
+    const add = ids.filter((i) => !cur.includes(i))
+    if (!add.length) return
+    qc.setQueryData(['alertReads'], [...cur, ...add])
+    try {
+      qc.setQueryData(['alertReads'], await markAlertsRead(add))
+    } catch (e) {
+      qc.invalidateQueries({ queryKey: ['alertReads'] })
+      throw e
+    }
+  }
+}
+
+/* ---------- event detail: assessment outcome + review state ---------- */
+function AssessmentCard({ e, a, loading }: { e: InjuryEvent; a: AssessmentDto | null; loading: boolean }) {
+  const { user } = useAuth()
+  const toast = useToast()
+  const refresh = useRefreshAll()
+  const [busy, setBusy] = useState(false)
+  const medical = user?.role === 'MEDICAL'
+
+  const setReviewed = async (v: boolean) => {
+    setBusy(true)
+    try {
+      if (v) await resolveEvent(e.id)
+      else await reopenEvent(e.id)
+      toast(v ? 'Marked as reviewed.' : 'Reopened: the incident is back in the review queue.')
+      refresh()
+    } catch (x) {
+      toast(normalizeApiError(x), true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const Item = ({ l, v }: { l: string; v?: string }) => <div><dt className="text-xs text-slate-500">{l}</dt><dd className="font-medium">{v || '—'}</dd></div>
+
+  return (
+    <Card>
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="mr-auto font-semibold">Medical assessment</h2>
+        {a && <Badge tone={STATUS_TONE[a.status] ?? 'gray'}>{a.status}</Badge>}
+        <Badge tone={e.resolved ? 'green' : 'gray'}>{e.resolved ? 'Reviewed' : 'Pending review'}</Badge>
+      </div>
+      {loading ? <div className="mt-3 space-y-2"><Skeleton /><Skeleton /></div>
+        : !a ? (
+          <p className="mt-2 text-sm text-slate-500">{medical ? 'No assessment recorded yet. Examine the player, then record the findings.' : 'Medical staff have not recorded an assessment for this incident yet.'}</p>
+        ) : medical ? (
+          <>
+            <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+              <Item l="Pain" v={a.pain} /><Item l="Swelling" v={a.swelling} /><Item l="Tenderness" v={a.tenderness} /><Item l="Range of motion" v={a.rom} />
+              <Item l="Weight bearing" v={a.weight} /><Item l="Neurovascular" v={a.neuro} /><Item l="Imaging considered" v={a.imaging || 'None'} /><Item l="Final status" v={a.status} />
+            </dl>
+            <div className="mt-3 rounded-lg bg-slate-50 p-3 text-sm"><p className="text-xs font-semibold uppercase text-slate-500">Clinical impression</p><p className="whitespace-pre-wrap">{a.impression}</p>{a.notes && <><p className="mt-2 text-xs font-semibold uppercase text-slate-500">General observations</p><p className="whitespace-pre-wrap">{a.notes}</p></>}</div>
+          </>
+        ) : (
+          <p className="mt-2 text-sm text-slate-700">Outcome: <b>{a.status}</b>{a.status === 'Cleared' ? ' — the player has been cleared by medical staff.' : '.'} <span className="text-slate-500">Clinical notes are visible to medical staff only.</span></p>
+        )}
+      {a && <p className="mt-2 text-xs text-slate-500">Recorded by {a.saved_by} on {fmtDate(a.saved_at)}{a.revision && a.revision > 1 ? ` · edited ${a.revision - 1} time(s)` : ''}</p>}
+      {medical && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Link className={btnSm} to={`/events/${e.id}/assessment`}>{a ? <><Pencil size={14} />Edit assessment</> : <><ClipboardPlus size={14} />Record assessment</>}</Link>
+          {e.resolved
+            ? <button className={btnSm} disabled={busy} onClick={() => setReviewed(false)}><RotateCcw size={14} />Reopen for review</button>
+            : <button className={btnSm} disabled={busy} onClick={() => setReviewed(true)}><CheckCircle2 size={14} />Mark as reviewed</button>}
+        </div>
+      )}
+    </Card>
+  )
+}
+
+/* ---------- alerts with a per-user read state ---------- */
+function StaffAlerts() {
+  const { user } = useAuth()
+  const prefs = usePrefs(user?.name)
+  const [pri, setPri] = useState('All')
+  const [read, setRead] = useState('All')
+  const [busy, setBusy] = useState(false)
+  const toast = useToast()
+  const ev = useEvents()
+  const reads = useAlertReads()
+  const markRead = useMarkRead()
+  const readSet = new Set(reads.data ?? [])
+  const all = ev.data ?? []
+  const shown = all.filter((e) => prefs.alertRisks.includes(e.risk ?? 'LOW'))
+  const hidden = all.length - shown.length
+  const unread = shown.filter((e) => !readSet.has(e.id))
+  const list = shown
+    .filter((e) => (pri === 'All' || e.risk === pri.toUpperCase()) && (read === 'All' || (read === 'Unread' ? !readSet.has(e.id) : readSet.has(e.id))))
+    .sort((a, b) => byRisk(a, b) || +new Date(b.timestamp) - +new Date(a.timestamp))
+
+  const markAll = async () => {
+    if (!unread.length) { toast('Every alert is already read.'); return }
+    setBusy(true)
+    try { await markRead(unread.map((e) => e.id)); toast(`Marked ${unread.length} alert(s) as read.`) } catch (x) { toast(normalizeApiError(x), true) } finally { setBusy(false) }
+  }
+  const open = (id: number) => { markRead([id]).catch(() => undefined) }
+
+  return (
+    <>
+      <PageHeader title="Alerts" crumbs={[{ label: 'Alerts' }]} actions={<button className={btnS} disabled={busy || reads.isLoading} onClick={markAll}><CheckCheck size={16} />Mark all as read{unread.length > 0 && ` (${unread.length})`}</button>} />
+      <Card className="!p-0">
+        <div className="flex flex-wrap items-center gap-2 border-b p-3">{['All', 'High', 'Medium', 'Low'].map((p) => <button key={p} aria-pressed={pri === p} onClick={() => setPri(p)} className={`${btn} ${pri === p ? 'bg-[#0b1f3a] text-white' : 'border border-slate-300'}`}>{p}</button>)}<span className="ml-auto text-sm text-slate-500">{unread.length} unread</span><select aria-label="Read state" className={inpAuto} value={read} onChange={(e) => setRead(e.target.value)}><option>All</option><option>Unread</option><option>Read</option></select></div>
+        {ev.isLoading ? <div className="space-y-2 p-4"><Skeleton /><Skeleton /></div>
+          : ev.isError ? <ErrorState title="Unable to load alerts" text={normalizeApiError(ev.error)} onRetry={() => ev.refetch()} />
+          : list.length === 0 ? <EmptyState title={read === 'Unread' ? 'No unread alerts' : 'No alerts'} text={read === 'Unread' ? 'You are all caught up.' : 'High, medium and low priority alerts will appear here, with unread alerts highlighted.'} />
+          : <ul className="divide-y divide-slate-100">{list.map((e) => {
+            const isUnread = !readSet.has(e.id)
+            return (
+              <li key={e.id} className={isUnread ? 'bg-sky-50/40' : ''}>
+                <Link to={`/events/${e.id}`} onClick={() => open(e.id)} className="flex items-start gap-3 px-4 py-3 hover:bg-slate-50">
+                  <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${isUnread ? 'bg-sky-500' : 'bg-transparent'}`} aria-label={isUnread ? 'Unread' : 'Read'} />
+                  <div className="min-w-0 flex-1"><p className={`text-sm ${isUnread ? 'font-semibold' : 'font-medium text-slate-700'}`}>{e.player.name ?? 'Unidentified player'} · {e.eventType} · {e.region ?? '—'}</p><p className="truncate text-xs text-slate-500">{e.injuryNote ?? e.note ?? ''}</p><p className="text-xs text-slate-400">{fmtDate(e.timestamp)}{e.matchName ? ` · ${e.matchName}` : ''}{e.resolved ? ' · reviewed by medical staff' : ''}</p></div>
+                  <RiskBadge level={e.risk} />
+                </Link>
+              </li>
+            )
+          })}</ul>}
+        {hidden > 0 && <p className="border-t px-4 py-3 text-xs text-slate-500">{hidden} alert(s) hidden by your notification settings. <Link to="/settings?tab=Notifications" className="text-blue-700 underline">Change</Link></p>}
+      </Card>
+    </>
+  )
+}
+
+/* ---------- settings: profile, time format, which alerts to show, change password ---------- */
+const pwSchema = z.object({
+  current: z.string().min(1, 'Enter your current password'),
+  next: z.string().min(6, 'New password must be at least 6 characters').max(72, 'New password must be 72 characters or fewer'),
+  confirm: z.string(),
+}).refine((v) => v.next === v.confirm, { path: ['confirm'], message: 'Passwords do not match' })
+  .refine((v) => v.next !== v.current, { path: ['next'], message: 'New password must be different from the current one' })
+
+function StaffSettings() {
+  const { user } = useAuth()
+  const toast = useToast()
+  const [sp, setSp] = useSearchParams()
+  const TABS = ['Profile', 'Preferences', 'Notifications', 'Security']
+  const tab = TABS.includes(sp.get('tab') ?? '') ? sp.get('tab')! : 'Profile'
+  const setTab = (t: string) => setSp(t === 'Profile' ? {} : { tab: t }, { replace: true })
+  const me = useQuery({ queryKey: ['me'], queryFn: getMe })
+  const saved = usePrefs(user?.name)
+  const [draft, setDraft] = useState<Prefs | null>(null)
+  const p = draft ?? saved
+  const [show, setShow] = useState(false)
+  const [pwErr, setPwErr] = useState('')
+  const f = useForm<z.infer<typeof pwSchema>>({ resolver: zodResolver(pwSchema), defaultValues: { current: '', next: '', confirm: '' } })
+
+  const savePref = () => {
+    if (!user) return
+    if (!p.alertRisks.length) { toast('Pick at least one alert level.', true); return }
+    savePrefs(user.name, p)
+    setDraft(null)
+    toast('Settings saved.')
+  }
+  const toggleRisk = (r: RiskLevel) => setDraft({ ...p, alertRisks: p.alertRisks.includes(r) ? p.alertRisks.filter((x) => x !== r) : [...p.alertRisks, r] })
+  const changePw = f.handleSubmit(async (v) => {
+    setPwErr('')
+    try {
+      await changePassword(v.current, v.next)
+      f.reset()
+      toast('Password changed. Use the new password next time you log in.')
+    } catch (x) {
+      setPwErr(normalizeApiError(x))
+    }
+  })
+  const example = new Date().toLocaleString(undefined, p.timeFormat ? { hour12: p.timeFormat === '12h' } : undefined)
+  const pw = (n: 'current' | 'next' | 'confirm', label: string, auto: string) => (
+    <Field label={label} err={f.formState.errors[n]?.message}><input type={show ? 'text' : 'password'} autoComplete={auto} className={inp} {...f.register(n)} /></Field>
+  )
+
+  return (
+    <>
+      <PageHeader title="Settings" crumbs={[{ label: 'Settings' }]} />
+      <div role="tablist" className="mb-4 flex gap-1 overflow-x-auto border-b">{TABS.map((t) => <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm ${tab === t ? 'border-b-2 border-[#0b1f3a] font-semibold' : 'text-slate-500'}`}>{t}</button>)}</div>
+      <Card className="max-w-xl space-y-3">
+        {tab === 'Profile' && (
+          <>
+            <Field label="Username"><input className={inp + ' bg-slate-50'} value={me.data?.username ?? user?.name ?? ''} readOnly /></Field>
+            <Field label="Role"><input className={inp + ' bg-slate-50'} value={user ? ROLE_LABEL[user.role] : ''} readOnly /></Field>
+            {user?.role === 'COACH' && <Field label="Team"><input className={inp + ' bg-slate-50'} value={me.isLoading ? 'Loading…' : me.data?.teamName ?? '—'} readOnly /></Field>}
+            {me.isError && <p className="text-sm text-red-700">{normalizeApiError(me.error)}</p>}
+            <p className="text-xs text-slate-500">Your username, role{user?.role === 'COACH' ? ' and team' : ''} are set by the administrator. You can change your password under Security.</p>
+          </>
+        )}
+        {tab === 'Preferences' && (
+          <>
+            <Field label="Time format"><select className={inp} value={p.timeFormat} onChange={(e) => setDraft({ ...p, timeFormat: e.target.value as Prefs['timeFormat'] })}><option value="">This computer's default</option><option value="24h">24-hour</option><option value="12h">12-hour (AM/PM)</option></select></Field>
+            <p className="text-sm text-slate-600">Example: <b>{example}</b></p>
+            <div className="flex gap-2"><button className={btnP} disabled={!draft} onClick={savePref}>Save changes</button>{draft && <button className={btnS} onClick={() => setDraft(null)}>Cancel</button>}</div>
+          </>
+        )}
+        {tab === 'Notifications' && (
+          <>
+            <p className="text-sm text-slate-600">Choose which alerts appear in Alerts and in the bell at the top of the page.</p>
+            {([['HIGH', 'High-risk alerts'], ['MEDIUM', 'Medium-risk alerts'], ['LOW', 'Low-risk alerts']] as [RiskLevel, string][]).map(([r, l]) => <label key={r} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={p.alertRisks.includes(r)} onChange={() => toggleRisk(r)} />{l}</label>)}
+            {!p.alertRisks.length && <p className="text-sm text-red-700">Pick at least one alert level.</p>}
+            <div className="flex gap-2"><button className={btnP} disabled={!draft || !p.alertRisks.length} onClick={savePref}>Save changes</button>{draft && <button className={btnS} onClick={() => setDraft(null)}>Cancel</button>}<button className={btnS + ' ml-auto'} onClick={() => setDraft({ ...p, alertRisks: [...DEFAULT_PREFS.alertRisks] })}>Show all</button></div>
+            <p className="text-xs text-slate-500">Saved in this browser for {user?.name}.</p>
+          </>
+        )}
+        {tab === 'Security' && (
+          <form className="space-y-3" noValidate onSubmit={changePw}>
+            {pw('current', 'Current password', 'current-password')}
+            {pw('next', 'New password', 'new-password')}
+            {pw('confirm', 'Confirm new password', 'new-password')}
+            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={show} onChange={(e) => setShow(e.target.checked)} />Show passwords</label>
+            {pwErr && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800">{pwErr}</p>}
+            <button className={btnP} disabled={f.formState.isSubmitting}>{f.formState.isSubmitting ? 'Changing…' : 'Change password'}</button>
+          </form>
+        )}
+      </Card>
+    </>
+  )
+}
+
+/* ---------- player reference photos (known_players folder, used for face recognition) ---------- */
+const PHOTO_RE = /\.(jpe?g|png|webp|bmp)$/i
+const MAX_PHOTO_MB = 8
+
+function PhotoThumb({ playerId, name, onDelete }: { playerId: number; name: string; onDelete: () => void }) {
+  const q = useQuery({ queryKey: ['photo', playerId, name], queryFn: () => getPlayerPhotoBlob(playerId, name), staleTime: Infinity })
+  const [url, setUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (!q.data) return
+    const u = URL.createObjectURL(q.data)
+    setUrl(u)
+    return () => URL.revokeObjectURL(u)
+  }, [q.data])
+  return (
+    <figure className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+      <div className="grid aspect-square place-items-center bg-slate-100">
+        {url ? <img src={url} alt={`Reference photo ${name}`} className="h-full w-full object-cover" /> : q.isError ? <ImageOff className="text-slate-400" /> : <Loader2 className="animate-spin text-slate-400" />}
+      </div>
+      <figcaption className="flex items-center gap-2 p-2 text-xs"><span className="min-w-0 flex-1 truncate text-slate-600" title={name}>{name}</span><button aria-label={`Delete ${name}`} title="Delete photo" className="text-red-600 hover:text-red-800" onClick={onDelete}><Trash2 size={14} /></button></figcaption>
+    </figure>
+  )
+}
+
+function PlayerPhotos({ playerId, name }: { playerId: number; name: string }) {
+  const qc = useQueryClient()
+  const toast = useToast()
+  const q = useQuery({ queryKey: ['photos', playerId], queryFn: () => getPlayerPhotos(playerId) })
+  const [left, setLeft] = useState(0)
+  const [del, setDel] = useState<string | null>(null)
+
+  const upload = async (files: FileList | null) => {
+    const list = Array.from(files ?? [])
+    if (!list.length) return
+    const bad = list.filter((x) => !PHOTO_RE.test(x.name) || x.size > MAX_PHOTO_MB * 1024 * 1024)
+    const good = list.filter((x) => !bad.includes(x))
+    if (bad.length) toast(`Skipped ${bad.map((x) => x.name).join(', ')}: use JPG, PNG, WEBP or BMP up to ${MAX_PHOTO_MB} MB.`, true)
+    let done = 0
+    for (let i = 0; i < good.length; i++) {
+      setLeft(good.length - i)
+      try { await uploadPlayerPhoto(playerId, good[i]); done++ } catch (x) { toast(`${good[i].name}: ${normalizeApiError(x)}`, true) }
+    }
+    setLeft(0)
+    if (done) toast(`Uploaded ${done} photo(s) for ${name}.`)
+    qc.invalidateQueries({ queryKey: ['photos', playerId] })
+  }
+
+  const remove = async (file: string) => {
+    try {
+      await deletePlayerPhoto(playerId, file)
+      toast('Photo deleted.')
+      qc.invalidateQueries({ queryKey: ['photos', playerId] })
+    } catch (x) {
+      toast(normalizeApiError(x), true)
+    }
+  }
+
+  if (q.isLoading) return <div className="space-y-2"><Skeleton /><Skeleton /></div>
+  if (q.isError) return <ErrorState title="Reference photos unavailable" text={normalizeApiError(q.error)} onRetry={() => q.refetch()} />
+  const d = q.data!
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start gap-3">
+        <p className="min-w-0 flex-1 text-sm text-slate-600">Add clear photos of {name}'s face (front, and side if you have them). They are saved in the <code>known_players</code> folder as <b>{d.folder}</b>. The detector loads them the next time it starts and uses them to recognise the player by face.</p>
+        <label className={btnP + (left ? ' pointer-events-none opacity-60' : ' cursor-pointer')}>
+          {left ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}{left ? `Uploading… ${left} left` : 'Upload photos'}
+          <input type="file" accept=".jpg,.jpeg,.png,.webp,.bmp,image/jpeg,image/png,image/webp,image/bmp" multiple className="sr-only" disabled={!!left} onChange={(e) => { upload(e.target.files); e.target.value = '' }} />
+        </label>
+      </div>
+      {d.photos.length === 0 ? <EmptyState title="No reference photos yet" text="Upload one or more face photos to help the detector recognise this player." />
+        : <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">{d.photos.map((ph) => <PhotoThumb key={ph.name} playerId={playerId} name={ph.name} onDelete={() => setDel(ph.name)} />)}</div>}
+      <p className="text-xs text-slate-500">{d.photos.length} photo(s) uploaded · {d.auto_learned} face(s) learned automatically by the detector during matches.</p>
+      <Confirm open={!!del} title="Delete photo?" text={`${del ?? ''} will be removed from ${d.folder}. The detector stops using it the next time it starts.`} confirmLabel="Delete photo" onConfirm={() => { if (del) remove(del) }} onClose={() => setDel(null)} />
+    </div>
+  )
+}
+
+/* ---------- match processing status from the detector's heartbeat ---------- */
+function matchState(d: DetectorProgressDto | undefined, matchId: number, known: boolean): { label: string; tone: Tone; pct: number | null; live: boolean } {
+  if (d && d.match_id === matchId) {
+    if (d.state === 'running' || d.state === 'starting') {
+      const pct = d.frame && d.total_frames ? Math.min(100, Math.round((100 * d.frame) / d.total_frames)) : null
+      return { label: d.state === 'starting' ? 'Starting' : 'Processing', tone: 'blue', pct, live: true }
+    }
+    if (d.state === 'stopped') return { label: 'Stopped early', tone: 'amber', pct: null, live: false }
+  }
+  return known ? { label: 'Completed', tone: 'green', pct: null, live: false } : { label: 'Status unknown', tone: 'gray', pct: null, live: false }
+}
+
+function MatchStatusBadge({ matchId, known }: { matchId: number; known: boolean }) {
+  const s = matchState(useDetector().data, matchId, known)
+  return <Badge tone={s.tone}>{s.live && <Loader2 size={12} className="animate-spin" />}{s.label}{s.pct !== null && ` · ${s.pct}%`}</Badge>
+}
+
+function MatchProgress({ matchId, events, known }: { matchId: number; events: number; known: boolean }) {
+  const d = useDetector()
+  const s = matchState(d.data, matchId, known)
+  const p = d.data
+  return (
+    <Card>
+      <h2 className="font-semibold">AI processing</h2>
+      <p className="mt-2 text-sm">Status: <MatchStatusBadge matchId={matchId} known={known} /></p>
+      {s.live && p ? (
+        <div className="mt-3">
+          <div className="h-2 overflow-hidden rounded bg-slate-200"><div className={`h-2 rounded bg-sky-500 transition-all ${s.pct === null ? 'w-1/3 animate-pulse' : ''}`} style={s.pct !== null ? { width: `${s.pct}%` } : undefined} /></div>
+          <p className="mt-1 text-xs text-slate-500">{p.frame ? `Frame ${p.frame.toLocaleString()}${p.total_frames ? ` of ${p.total_frames.toLocaleString()}` : ''}` : 'Loading the video…'} · {p.events ?? events} event(s) so far · updates every 5 s</p>
+        </div>
+      ) : s.label === 'Stopped early' ? (
+        <p className="mt-2 text-sm text-slate-600">The detector stopped before the end of the video. The {events} event(s) found so far are kept.</p>
+      ) : (
+        <p className="mt-2 text-sm text-slate-600">{known ? `Analysis finished · ${events} event(s) detected.` : 'This match has not been reported by the detector.'}</p>
+      )}
+      <p className="mt-3 text-xs text-slate-500">Only administrators can start an analysis.</p>
+    </Card>
+  )
 }

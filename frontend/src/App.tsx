@@ -31,8 +31,8 @@ export default function App() {
                 <Route path="/admin/dashboard" element={<G roles={['ADMIN']}><P.Dashboard role="ADMIN" /></G>} />
                 <Route path="/coach/dashboard" element={<G roles={['COACH']}><P.Dashboard role="COACH" /></G>} />
                 <Route path="/medical/dashboard" element={<G roles={['MEDICAL']}><P.Dashboard role="MEDICAL" /></G>} />
-                <Route path="/teams" element={<G roles={['ADMIN', 'COACH']}><P.ListPage k="teams" /></G>} />
-                <Route path="/teams/:id" element={<G roles={['ADMIN', 'COACH']}><P.Detail k="teams" /></G>} />
+                <Route path="/teams" element={<G roles={ALL}><P.ListPage k="teams" /></G>} />
+                <Route path="/teams/:id" element={<G roles={ALL}><P.Detail k="teams" /></G>} />
                 <Route path="/players" element={<G roles={ALL}><P.ListPage k="players" /></G>} />
                 <Route path="/players/:id" element={<G roles={ALL}><P.Detail k="players" /></G>} />
                 <Route path="/matches" element={<G roles={ALL}><P.ListPage k="matches" /></G>} />
@@ -44,8 +44,8 @@ export default function App() {
                 <Route path="/collisions" element={<G roles={ALL}><P.ListPage k="collisions" /></G>} />
                 <Route path="/collisions/:id" element={<G roles={ALL}><P.EventDetail collision /></G>} />
                 <Route path="/alerts" element={<G roles={ALL}><P.Alerts /></G>} />
-                <Route path="/reports" element={<G roles={['ADMIN', 'MEDICAL']}><P.ListPage k="reports" /></G>} />
-                <Route path="/reports/:id" element={<G roles={['ADMIN', 'MEDICAL']}><P.Detail k="reports" /></G>} />
+                <Route path="/reports" element={<G roles={ALL}><P.ListPage k="reports" /></G>} />
+                <Route path="/reports/:id" element={<G roles={ALL}><P.Detail k="reports" /></G>} />
                 <Route path="/admin/users" element={<G roles={['ADMIN']}><P.ListPage k="users" /></G>} />
                 <Route path="/admin/system" element={<G roles={['ADMIN']}><P.System /></G>} />
                 <Route path="/settings" element={<P.Settings />} />

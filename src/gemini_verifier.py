@@ -4,12 +4,16 @@ gemini_verifier.py - Gemini second opinion on every saved fall.
 Interface used by multi_player_injury.py:
     start(), submit(ids, raw_frames, target_index, target_box, context),
     shutdown(), is_available(), player_changes, deleted_event_ids, stats
+Also used by verify_clips.py (checks clips that are already saved):
+    init(), ask(), to_backend(), send_result(), team_names()
 
 What it does for each saved fall (runs in a background thread):
   - Sends the fall-moment frame (target player boxed), a zoomed crop and a few
     surrounding frames to Gemini.
-  - Confident false alarm  -> event row (and its clip file) deleted.
-  - Confident jersey read that differs from / fills in our player -> event updated.
+  - Sends Gemini's answer to the backend (PATCH /events/{id}/gemini), which
+    stores it so the dashboard shows it, and applies the rules:
+      confident false alarm  -> event row (and its clip file) deleted
+      confident jersey read that differs from / fills in our player -> event updated
 Any error = event left untouched (fails safe).
 Only the FIRST event id of a clip is judged (that is the boxed player).
 
@@ -24,6 +28,7 @@ import queue
 import threading
 
 import cv2
+import requests
 from dotenv import load_dotenv
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,12 +50,14 @@ _ENV_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
 FALSE_ALARM_CONFIDENCE = 0.85   # delete an event only if Gemini is at least this sure it is NOT a fall
 JERSEY_CONFIDENCE = 0.85        # replace/fill the player only if the jersey read is at least this sure
+DECIDED_CONFIDENCE = 0.60       # below this the verdict is stored as "unsure"
 MAX_SEQUENCE_FRAMES = 6         # surrounding frames sent besides the fall frame and the crop
 JPEG_QUALITY = 85
 MAX_RETRIES = 2
 SHUTDOWN_TIMEOUT_SEC = 180
 
-clips_dir = os.path.join(_HERE, "output", "clips")
+API_BASE = os.getenv("ATHLETEGUARD_API", "http://127.0.0.1:8000").rstrip("/")
+API_TIMEOUT = 20
 
 # Optional: set to a callable(text) to send a correction message (e.g. WhatsApp)
 notify_hook = None
@@ -84,14 +91,18 @@ def is_available():
 # LIFECYCLE
 # ============================================
 
-def start():
-    global _client, _types, _worker, _models
+def init():
+    """Creates the Gemini client. Returns True when Gemini can be used."""
+    global _client, _types, _models
+
+    if _client is not None:
+        return True
 
     key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
     if not key:
         print("[GEMINI] No GEMINI_API_KEY found - Gemini check disabled.")
-        return
+        return False
 
     try:
         from google import genai
@@ -121,12 +132,20 @@ def start():
     except Exception as e:
         print("[GEMINI] Could not start (pip install google-genai):", e)
         _client = None
+        return False
+
+    print("[GEMINI] Second-opinion check ON |", mode, "| model:", _models[0])
+    return True
+
+
+def start():
+    global _worker
+
+    if not init():
         return
 
     _worker = threading.Thread(target=_worker_loop, daemon=True)
     _worker.start()
-
-    print("[GEMINI] Second-opinion check ON |", mode, "| model:", _models[0])
 
 
 def submit(ids, raw_frames, target_index, target_box, context):
@@ -253,12 +272,13 @@ Decide:
 3. jersey_number: shirt number of the boxed player ONLY if clearly readable in the images, else null. Never guess.
 4. jersey_confidence: 0.0-1.0 for the number read (0 if null).
 5. team: the boxed player's team from [{teams}] judged from kit colours, else null.
-6. reason: one short sentence.
+6. description: one short sentence describing what happens to the player (e.g. "tackled from behind, lands on the left knee and stays down").
+7. reason: one short sentence explaining your real_fall decision.
 
 Detector context (may be partial): {ctx}
 
 Reply with JSON only:
-{{"real_fall": true, "confidence": 0.0, "jersey_number": null, "jersey_confidence": 0.0, "team": null, "reason": ""}}"""
+{{"real_fall": true, "confidence": 0.0, "jersey_number": null, "jersey_confidence": 0.0, "team": null, "description": "", "reason": ""}}"""
 
 
 def _make_config():
@@ -281,7 +301,7 @@ def _make_config():
     return types.GenerateContentConfig(**kwargs)
 
 
-def _ask(images, context, team_names):
+def _ask(images, context, team_names, prompt=None):
     global _models
 
     types = _types
@@ -290,7 +310,7 @@ def _ask(images, context, team_names):
     for label, data in images:
         contents.append(label)
         contents.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
-    contents.append(_prompt(context, team_names))
+    contents.append(prompt or _prompt(context, team_names))
 
     config = _make_config()
 
@@ -349,8 +369,72 @@ def _as_float(v):
 
 
 # ============================================
-# APPLY THE VERDICT
+# APPLY THE VERDICT (through the backend, so it is stored and shown in the dashboard)
 # ============================================
+
+def ask(images, prompt):
+    """Public wrapper for verify_clips.py."""
+    return _ask(images, None, None, prompt=prompt)
+
+
+def to_backend(raw):
+    """Gemini's JSON -> body for PATCH /events/{id}/gemini."""
+
+    real_fall = _as_bool(raw.get("real_fall"), True)
+    confidence = _as_float(raw.get("confidence"))
+
+    if confidence < DECIDED_CONFIDENCE:
+        verdict = "unsure"
+    else:
+        verdict = "real_fall" if real_fall else "false_alarm"
+
+    try:
+        jersey = int(raw.get("jersey_number")) if raw.get("jersey_number") is not None else None
+    except (TypeError, ValueError):
+        jersey = None
+
+    team = str(raw.get("team") or "").strip() or None
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "reason": str(raw.get("reason") or "")[:300] or None,
+        "description": str(raw.get("description") or "")[:300] or None,
+        "team": team,
+        "jersey_number": jersey,
+        "jersey_confidence": _as_float(raw.get("jersey_confidence")) if jersey is not None else None,
+    }
+
+
+def send_result(event_id, body, keep_false_alarm=False, min_jersey_confidence=JERSEY_CONFIDENCE):
+    """Stores the verdict through the backend. Returns the backend's answer ({"action": ...})."""
+
+    params = {"min_jersey_confidence": min_jersey_confidence}
+    if keep_false_alarm:
+        params["keep_false_alarm"] = "true"
+
+    r = requests.patch(API_BASE + "/events/" + str(event_id) + "/gemini", json=body, params=params, timeout=API_TIMEOUT)
+
+    if r.status_code == 404:
+        return {"action": "missing"}
+
+    r.raise_for_status()
+    return r.json()
+
+
+def team_names():
+    try:
+        from database import SessionLocal
+        from models import Team
+        db = SessionLocal()
+        try:
+            return [t.name for t in db.query(Team).order_by(Team.id).all()]
+        finally:
+            db.close()
+    except Exception as e:
+        print("[GEMINI] Could not read team names:", e)
+        return []
+
 
 def _notify(text):
     print("[GEMINI]", text)
@@ -362,146 +446,59 @@ def _notify(text):
             print("[GEMINI] notify_hook failed:", e)
 
 
-def _delete_clip_file(clip_path):
-    if not clip_path:
-        return
+def apply_answer(event_id, body, answer, previous_player=None):
+    """Updates the counters and prints/notifies what the backend did."""
 
-    for folder in (clips_dir, os.path.join(os.getcwd(), "output", "clips")):
-        path = os.path.join(folder, clip_path)
-        if os.path.isfile(path):
-            try:
-                os.remove(path)
-                return
-            except OSError:
-                pass
+    action = answer.get("action")
+    event = answer.get("event") or {}
+    conf = body.get("confidence") or 0.0
 
+    if action == "deleted":
+        deleted_event_ids.add(event_id)
+        stats["false_alarm_deleted"] += 1
+        _notify(
+            f"Correction: event #{event_id} ({previous_player or 'Unidentified'}) was a false alarm and was removed "
+            f"(confidence {conf:.2f}). {body.get('reason') or ''}"
+        )
 
-def _process(job):
-    from database import SessionLocal
-    from models import InjuryEvent, Player, Team
-
-    ids, frames, target_index, box, context = job
-    event_id = ids[0]   # the clip's target box belongs to the first event
-
-    db = SessionLocal()
-
-    try:
-        ev = db.get(InjuryEvent, event_id)
-
-        if ev is None:
-            return
-
-        team_names = [t.name for t in db.query(Team).all()]
-
-        images = _build_images(frames, target_index, box)
-
-        if not images:
-            return
-
-        verdict = _ask(images, context, team_names)
-
-        stats["checked"] += 1
-
-        real_fall = _as_bool(verdict.get("real_fall"), True)
-        confidence = _as_float(verdict.get("confidence"))
-        reason = str(verdict.get("reason") or "")[:200]
-
-        # ---- confident false alarm -> delete ----
-        if not real_fall and confidence >= FALSE_ALARM_CONFIDENCE:
-            who = ev.player.name if ev.player else "Unidentified"
-            clip_path = ev.clip_path
-
-            db.delete(ev)
-            db.commit()
-
-            _delete_clip_file(clip_path)
-
-            deleted_event_ids.add(event_id)
-            stats["false_alarm_deleted"] += 1
-
-            _notify(
-                f"Correction: event #{event_id} ({who}) was a false alarm and was removed "
-                f"(confidence {confidence:.2f}). {reason}"
-            )
-            return
-
-        # ---- jersey read -> fill in / replace the player ----
-        jersey = verdict.get("jersey_number")
-        jersey_conf = _as_float(verdict.get("jersey_confidence"))
-        team_hint = str(verdict.get("team") or "").strip().lower()
-
-        print(f"[GEMINI] #{event_id}: fall={real_fall} ({confidence:.2f}) | "
-              f"jersey={jersey} ({jersey_conf:.2f}) | team={team_hint or None} | {reason}")
-
-        try:
-            jersey = int(jersey) if jersey is not None else None
-        except (TypeError, ValueError):
-            jersey = None
-
-        if jersey is None:
-            print(f"[GEMINI] #{event_id}: no readable jersey number -> player unchanged")
-            return
-
-        if jersey_conf < JERSEY_CONFIDENCE:
-            print(f"[GEMINI] #{event_id}: jersey #{jersey} too uncertain "
-                  f"({jersey_conf:.2f} < {JERSEY_CONFIDENCE}) -> player unchanged")
-            return
-
-        candidates = db.query(Player).filter(Player.jersey_number == jersey).all()
-
-        if not candidates:
-            print(f"[GEMINI] #{event_id}: no player with jersey #{jersey} in the roster")
-            return
-
-        if len(candidates) > 1:
-            teams_by_id = {t.id: t.name.lower() for t in db.query(Team).all()}
-            narrowed = [
-                p for p in candidates
-                if team_hint and (
-                    teams_by_id.get(p.team_id, "") == team_hint
-                    or team_hint in teams_by_id.get(p.team_id, "")
-                    or teams_by_id.get(p.team_id, "") in team_hint
-                )
-            ]
-            if len(narrowed) != 1:
-                print(f"[GEMINI] #{event_id}: jersey #{jersey} exists in {len(candidates)} teams "
-                      f"and team '{team_hint}' did not pick one -> unchanged")
-                return
-            candidates = narrowed
-
-        if len(candidates) != 1:
-            return
-
-        new_player = candidates[0]
-
-        if ev.player_id == new_player.id:
-            return
-
-        old_conf = ev.identification_confidence or ev.id_confidence or 0.0
-        old_name = ev.player.name if ev.player else None
-
-        if ev.player_id is not None and old_conf >= jersey_conf:
-            return   # our existing read is at least as sure
-
-        ev.player_id = new_player.id
-        ev.identification_method = "gemini"
-        ev.identified_by = "gemini"
-        ev.identification_confidence = jersey_conf
-        ev.id_confidence = jersey_conf
-        ev.id_detail = f"gemini jersey #{jersey}"
-        db.commit()
-
-        player_changes[event_id] = new_player.name
-
-        if old_name is None:
+    elif action in ("identified", "reassigned"):
+        name = event.get("player_name")
+        player_changes[event_id] = name
+        if action == "identified":
             stats["identified"] += 1
-            _notify(f"Event #{event_id} identified by Gemini as {new_player.name} (#{jersey}).")
+            _notify(f"Event #{event_id} identified by Gemini as {name} (#{body.get('jersey_number')}).")
         else:
             stats["reassigned"] += 1
             _notify(
-                f"Correction: event #{event_id} was {old_name}, now {new_player.name} (#{jersey}) "
-                f"per Gemini (confidence {jersey_conf:.2f})."
+                f"Correction: event #{event_id} was {previous_player}, now {name} (#{body.get('jersey_number')}) "
+                f"per Gemini (confidence {(body.get('jersey_confidence') or 0):.2f})."
             )
 
-    finally:
-        db.close()
+    return action
+
+
+def _process(job):
+    ids, frames, target_index, box, context = job
+    event_id = ids[0]   # the clip's target box belongs to the first event
+
+    images = _build_images(frames, target_index, box)
+
+    if not images:
+        return
+
+    raw = _ask(images, context, team_names())
+    stats["checked"] += 1
+
+    body = to_backend(raw)
+
+    print(f"[GEMINI] #{event_id}: {body['verdict']} ({body['confidence']:.2f}) | "
+          f"jersey={body['jersey_number']} ({(body['jersey_confidence'] or 0):.2f}) | "
+          f"team={body['team']} | {body['reason']}")
+
+    previous = (context or {}).get("player")
+
+    # false alarms are removed only when Gemini is at least FALSE_ALARM_CONFIDENCE sure
+    keep = body["verdict"] == "false_alarm" and body["confidence"] < FALSE_ALARM_CONFIDENCE
+
+    answer = send_result(event_id, body, keep_false_alarm=keep, min_jersey_confidence=JERSEY_CONFIDENCE)
+    apply_answer(event_id, body, answer, previous_player=previous)

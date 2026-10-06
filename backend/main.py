@@ -291,6 +291,16 @@ def _remove_clip_file(clip_path):
         pass
 
 
+def _clip_used_by_other_event(db, clip_path, exclude_ids):
+    """One clip file can belong to several events (players who fell in the same frame)."""
+    if not clip_path:
+        return False
+    q = db.query(InjuryEvent.id).filter(InjuryEvent.clip_path == clip_path)
+    if exclude_ids:
+        q = q.filter(InjuryEvent.id.notin_(list(exclude_ids)))
+    return q.first() is not None
+
+
 def remove_duplicate_events(db, dry_run=False):
     """
     Keeps one event per fall and deletes the extra copies (and their clip files).
@@ -342,8 +352,10 @@ def remove_duplicate_events(db, dry_run=False):
                     keeper.clip_path = m.clip_path
                     break
 
+        extra_ids = [m.id for m in extras]
         for m in extras:
-            if m.clip_path and m.clip_path != keeper.clip_path:
+            if (m.clip_path and m.clip_path != keeper.clip_path
+                    and not _clip_used_by_other_event(db, m.clip_path, extra_ids)):
                 _remove_clip_file(m.clip_path)
             db.delete(m)
 
@@ -701,10 +713,9 @@ def ai_update_event(event_id: int, request: EventAIUpdateRequest, db: Session = 
 
     if request.clip_path is not None:
         # A re-run of the same video sends a second clip for the same fall:
-        # keep the clip that already works and delete the new copy.
-        if event.clip_path and event.clip_path != request.clip_path and _clip_exists(event.clip_path):
-            _remove_clip_file(request.clip_path)
-        else:
+        # keep the clip that already works. The new file is NOT deleted, because
+        # another (new) event from the same frame may be using it.
+        if not (event.clip_path and event.clip_path != request.clip_path and _clip_exists(event.clip_path)):
             event.clip_path = request.clip_path
 
     if request.injury_note is not None:
@@ -717,13 +728,21 @@ def ai_update_event(event_id: int, request: EventAIUpdateRequest, db: Session = 
 
 
 # ============================================
-# EVENTS — GEMINI SECOND OPINION (sent by src/gemini_verifier.py)
+# EVENTS — GEMINI SECOND OPINION (sent by src/gemini_verifier.py and src/verify_clips.py)
 # - confident false alarm  -> event and its clip are deleted
+#   (?keep_false_alarm=true only stores the verdict, the dashboard then shows it)
 # - confident jersey read  -> replaces our player if Gemini is surer
+#   (?min_jersey_confidence=0.85 asks for a stricter jersey rule than the default)
 # ============================================
 
 @app.patch("/events/{event_id}/gemini")
-def gemini_result(event_id: int, request: GeminiResultRequest, db: Session = Depends(get_db)):
+def gemini_result(
+    event_id: int,
+    request: GeminiResultRequest,
+    keep_false_alarm: bool = Query(False),
+    min_jersey_confidence: Optional[float] = Query(None),
+    db: Session = Depends(get_db)
+):
 
     event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
 
@@ -732,20 +751,20 @@ def gemini_result(event_id: int, request: GeminiResultRequest, db: Session = Dep
 
     verdict = (request.verdict or "unsure").lower()
     confidence = request.confidence if request.confidence is not None else 0.0
+    jersey_min = max(GEMINI_JERSEY_MIN_CONFIDENCE, min_jersey_confidence or 0.0)
 
     # 1) confident false alarm -> delete
-    if verdict == "false_alarm" and confidence >= GEMINI_DELETE_MIN_CONFIDENCE and event.identified_by != "manual":
+    if (verdict == "false_alarm" and confidence >= GEMINI_DELETE_MIN_CONFIDENCE
+            and event.identified_by != "manual" and not keep_false_alarm):
 
         clip_path = event.clip_path
+        shared = _clip_used_by_other_event(db, clip_path, [event.id])
 
         db.delete(event)
         db.commit()
 
-        if clip_path:
-            try:
-                os.remove(os.path.join(CLIPS_DIR, clip_path))
-            except OSError:
-                pass
+        if clip_path and not shared:
+            _remove_clip_file(clip_path)
 
         return {"action": "deleted", "event_id": event_id, "reason": request.reason}
 
@@ -768,7 +787,7 @@ def gemini_result(event_id: int, request: GeminiResultRequest, db: Session = Dep
         request.jersey_number is not None
         and request.team
         and request.team.lower() != "unknown"
-        and jersey_conf >= GEMINI_JERSEY_MIN_CONFIDENCE
+        and jersey_conf >= jersey_min
         and event.identified_by != "manual"
     ):
 
@@ -1036,9 +1055,7 @@ def get_teams(current_user: User = Depends(get_current_user), db: Session = Depe
         })
 
     return result
-
-
-# ============================================
+    # ============================================
 # MARK EVENT RESOLVED
 # ============================================
 
@@ -1432,3 +1449,596 @@ def system_status(current_user: User = Depends(get_current_user), db: Session = 
         "medical_knowledge_base": _medical_knowledge_base(),
         "last_job": last_job,
     }
+
+
+# ============================================
+# STAFF FEATURES (medical staff and coach dashboards)
+# Everything here is kept in small JSON files in the output folder,
+# so the database schema is not changed:
+#   output/assessments.json  - medical assessment per event
+#   output/alert_reads.json  - which alerts each user has read
+# Player reference photos go to known_players/<jersey> - <name>/,
+# the same folder the detector reads faces from.
+# ============================================
+
+import base64
+import re
+import unicodedata
+from fastapi.responses import FileResponse
+
+ASSESSMENTS_FILE = os.path.join(PROJECT_ROOT, "output", "assessments.json")
+ALERT_READS_FILE = os.path.join(PROJECT_ROOT, "output", "alert_reads.json")
+KNOWN_PLAYERS_DIR = os.path.join(PROJECT_ROOT, "known_players")
+AUTO_FACES_DIR = os.path.join(PROJECT_ROOT, "known_players_auto")
+
+ASSESSMENT_STATUSES = ("Under observation", "Further evaluation", "Imaging referred", "Cleared", "Referred")
+ASSESSMENT_KEEPS_OPEN = ("Under observation",)      # every other status marks the event as reviewed
+PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+MAX_PHOTO_BYTES = 8 * 1024 * 1024
+MAX_READS_PER_USER = 5000
+
+
+def _load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _save_json(path, data):
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail="Could not save: " + str(e))
+
+
+def _can_see_event(user: User, event: InjuryEvent):
+    """Medical/admin see every event. A coach sees their team's events and every Unidentified fall."""
+    if user.role in ("medical", "admin"):
+        return True
+    if user.role == "coach":
+        return event.player is None or event.player.team_id == user.team_id
+    return False
+
+
+def _visible_event(event_id: int, user: User, db: Session):
+    event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
+    if event is None or not _can_see_event(user, event):
+        raise HTTPException(status_code=404, detail="Event not found")
+    return event
+
+
+# ---------- who am I ----------
+
+@app.get("/auth/me")
+def me(current_user: User = Depends(get_current_user)):
+    return user_to_dict(current_user)
+
+
+# ---------- change own password ----------
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def change_password(request: ChangePasswordRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    new = request.new_password or ""
+
+    if not verify_password(request.current_password or "", current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    if len(new) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="New password must be at least " + str(MIN_PASSWORD_LENGTH) + " characters")
+
+    if len(new.encode("utf-8")) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail="New password must be " + str(MAX_PASSWORD_LENGTH) + " characters or fewer")
+
+    if new == request.current_password:
+        raise HTTPException(status_code=400, detail="New password must be different from the current one")
+
+    current_user.password_hash = pwd_context.hash(new)
+    db.commit()
+
+    print("[USERS]", current_user.username, "changed their password")
+
+    return {"message": "Password changed"}
+
+
+# ---------- medical assessments ----------
+
+class AssessmentRequest(BaseModel):
+    pain: str
+    swelling: str
+    tenderness: str
+    rom: str
+    weight: str
+    neuro: str
+    notes: str = ""
+    imaging: str = ""
+    impression: str
+    status: str
+
+
+def _assessment_for(user: User, record):
+    """Coaches only get the outcome, never the clinical notes."""
+    if record is None:
+        return None
+    if user.role in ("medical", "admin"):
+        return record
+    return {k: record.get(k) for k in ("event_id", "status", "saved_at", "saved_by")}
+
+
+@app.get("/assessments")
+def list_assessments(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    data = _load_json(ASSESSMENTS_FILE, {})
+    ids = [int(k) for k in data.keys() if str(k).isdigit()]
+
+    if not ids:
+        return []
+
+    events = db.query(InjuryEvent).filter(InjuryEvent.id.in_(ids)).all()
+    visible = {e.id for e in events if _can_see_event(current_user, e)}
+
+    # events deleted since (e.g. Gemini false alarm) are left out
+    return [_assessment_for(current_user, data[str(i)]) for i in sorted(visible)]
+
+
+@app.get("/events/{event_id}/assessment")
+def get_assessment(event_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    _visible_event(event_id, current_user, db)
+
+    record = _load_json(ASSESSMENTS_FILE, {}).get(str(event_id))
+
+    return {"assessment": _assessment_for(current_user, record)}
+
+
+@app.put("/events/{event_id}/assessment")
+def save_assessment(event_id: int, request: AssessmentRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    if current_user.role != "medical":
+        raise HTTPException(status_code=403, detail="Only medical staff can record assessments")
+
+    event = _visible_event(event_id, current_user, db)
+
+    fields = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+
+    for key in ("pain", "swelling", "tenderness", "rom", "weight", "neuro", "impression", "status"):
+        fields[key] = (fields.get(key) or "").strip()
+        if not fields[key]:
+            raise HTTPException(status_code=400, detail="'" + key + "' is required")
+
+    if fields["status"] not in ASSESSMENT_STATUSES:
+        raise HTTPException(status_code=400, detail="Final status must be one of: " + ", ".join(ASSESSMENT_STATUSES))
+
+    if len(fields["notes"]) > 4000 or len(fields["impression"]) > 4000:
+        raise HTTPException(status_code=400, detail="Notes are limited to 4000 characters")
+
+    data = _load_json(ASSESSMENTS_FILE, {})
+    previous = data.get(str(event_id)) or {}
+
+    record = dict(fields)
+    record["event_id"] = event_id
+    record["saved_by"] = current_user.username
+    record["saved_at"] = _now_utc().isoformat()
+    record["created_at"] = previous.get("created_at", record["saved_at"])
+    record["revision"] = int(previous.get("revision", 0)) + 1
+
+    data[str(event_id)] = record
+    _save_json(ASSESSMENTS_FILE, data)
+
+    # reviewed -> leaves the review queue; "Under observation" stays open
+    event.resolved = fields["status"] not in ASSESSMENT_KEEPS_OPEN
+    db.commit()
+
+    print("[ASSESSMENT]", current_user.username, "saved event", event_id, "->", fields["status"])
+
+    return {"message": "Assessment saved", "assessment": record, "resolved": event.resolved}
+
+
+@app.patch("/events/{event_id}/reopen")
+def reopen_event(event_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    if current_user.role not in ("medical", "admin"):
+        raise HTTPException(status_code=403, detail="Only medical staff can reopen an event")
+
+    event = _visible_event(event_id, current_user, db)
+    event.resolved = False
+    db.commit()
+
+    return {"message": "Event reopened"}
+
+
+# ---------- alert read state (per user) ----------
+
+class AlertReadRequest(BaseModel):
+    event_ids: list
+
+
+@app.get("/alerts/read")
+def get_alert_reads(current_user: User = Depends(get_current_user)):
+    return {"event_ids": _load_json(ALERT_READS_FILE, {}).get(current_user.username, [])}
+
+
+@app.post("/alerts/read")
+def mark_alerts_read(request: AlertReadRequest, current_user: User = Depends(get_current_user)):
+
+    try:
+        new_ids = {int(i) for i in (request.event_ids or [])}
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="event_ids must be a list of numbers")
+
+    data = _load_json(ALERT_READS_FILE, {})
+    ids = set(data.get(current_user.username, [])) | new_ids
+    data[current_user.username] = sorted(ids)[-MAX_READS_PER_USER:]
+    _save_json(ALERT_READS_FILE, data)
+
+    return {"event_ids": data[current_user.username]}
+
+
+# ---------- detector progress for match pages (every role) ----------
+
+@app.get("/detector/status")
+def detector_progress(current_user: User = Depends(get_current_user)):
+
+    status = _read_detector_status()
+
+    if status is None:
+        return {"state": "never"}
+
+    seconds_ago = None
+    try:
+        seconds_ago = round((_now_utc() - datetime.fromisoformat(status.get("last_seen"))).total_seconds())
+    except (TypeError, ValueError):
+        pass
+
+    state = status.get("state")
+    if state in ("starting", "running") and (seconds_ago is None or seconds_ago > HEARTBEAT_STALE_SECONDS):
+        state = "stopped"
+
+    info = status.get("info") or {}
+    progress = status.get("progress") or {}
+
+    return {
+        "state": state,
+        "match_id": info.get("match_id"),
+        "match_name": info.get("match_name"),
+        "frame": progress.get("frame"),
+        "total_frames": info.get("total_frames"),
+        "events": progress.get("events"),
+        "started_at": status.get("started_at"),
+        "finished_at": status.get("finished_at"),
+        "seconds_since_last_signal": seconds_ago,
+    }
+
+
+# ---------- player reference photos (known_players folder) ----------
+
+class PhotoUploadRequest(BaseModel):
+    filename: str
+    data_base64: str
+
+
+def _plain(s):
+    s = "".join(ch for ch in unicodedata.normalize("NFD", str(s).upper()) if unicodedata.category(ch) != "Mn")
+    return " ".join(s.split())
+
+
+def _folder_matches(folder_name, player_name):
+    """Same naming rules as src/player_identifier.py: "Name", "17 - Name", "17_Name"."""
+    candidates = [folder_name]
+    stripped = folder_name.lstrip("0123456789").lstrip(" _-.")
+    if stripped != folder_name:
+        candidates.append(stripped)
+    if " - " in folder_name:
+        candidates.extend(folder_name.split(" - "))
+    target = _plain(player_name)
+    return any(_plain(c) == target for c in candidates)
+
+
+def _find_folder(root, player):
+    if not os.path.isdir(root):
+        return None
+    for name in sorted(os.listdir(root)):
+        if os.path.isdir(os.path.join(root, name)) and _folder_matches(name, player.name):
+            return os.path.join(root, name)
+    return None
+
+
+def _player_folder(player, create=False):
+    folder = _find_folder(KNOWN_PLAYERS_DIR, player)
+    if folder is None and create:
+        safe_name = re.sub(r'[<>:"/\\|?*]', "", player.name).strip()
+        folder = os.path.join(KNOWN_PLAYERS_DIR, str(player.jersey_number) + " - " + safe_name)
+        os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _photo_player(player_id: int, user: User, db: Session):
+    player = db.query(Player).filter(Player.id == player_id).first()
+    if player is None:
+        raise HTTPException(status_code=404, detail="Player not found")
+    if user.role == "coach" and player.team_id != user.team_id:
+        raise HTTPException(status_code=403, detail="Coaches can only manage photos of their own team's players")
+    if user.role not in ("medical", "admin", "coach"):
+        raise HTTPException(status_code=403, detail="Unknown role")
+    return player
+
+
+def _safe_photo_name(filename):
+    name = os.path.basename(filename or "")
+    if not name or name != filename or name.startswith(".") or not name.lower().endswith(PHOTO_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Invalid photo name")
+    return name
+
+
+def _image_files(folder):
+    if folder is None or not os.path.isdir(folder):
+        return []
+    return sorted(f for f in os.listdir(folder) if f.lower().endswith(PHOTO_EXTENSIONS))
+
+
+@app.get("/players/{player_id}/photos")
+def list_player_photos(player_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    player = _photo_player(player_id, current_user, db)
+    folder = _player_folder(player)
+
+    photos = []
+    for name in _image_files(folder):
+        path = os.path.join(folder, name)
+        photos.append({
+            "name": name,
+            "size": os.path.getsize(path),
+            "uploaded_at": datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat(),
+        })
+
+    return {
+        "player_id": player.id,
+        "folder": os.path.basename(folder) if folder else str(player.jersey_number) + " - " + player.name,
+        "photos": photos,
+        "auto_learned": len(_image_files(_find_folder(AUTO_FACES_DIR, player))),
+    }
+
+
+@app.get("/players/{player_id}/photos/{filename}")
+def get_player_photo(player_id: int, filename: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    player = _photo_player(player_id, current_user, db)
+    name = _safe_photo_name(filename)
+    folder = _player_folder(player)
+
+    if folder is None or not os.path.isfile(os.path.join(folder, name)):
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    return FileResponse(os.path.join(folder, name))
+
+
+@app.post("/players/{player_id}/photos")
+def upload_player_photo(player_id: int, request: PhotoUploadRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    player = _photo_player(player_id, current_user, db)
+
+    ext = os.path.splitext(request.filename or "")[1].lower()
+    if ext not in PHOTO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, WEBP or BMP photos can be uploaded")
+
+    data = request.data_base64 or ""
+    if "," in data[:100]:
+        data = data.split(",", 1)[1]          # accept "data:image/jpeg;base64,..."
+
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="The photo could not be read")
+
+    if not raw:
+        raise HTTPException(status_code=400, detail="The photo is empty")
+
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=400, detail="Each photo must be 8 MB or smaller")
+
+    folder = _player_folder(player, create=True)
+    name = "upload_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ext
+
+    with open(os.path.join(folder, name), "wb") as f:
+        f.write(raw)
+
+    print("[PHOTOS]", current_user.username, "added", name, "for", player.name)
+
+    return {"message": "Photo uploaded", "name": name}
+
+
+@app.delete("/players/{player_id}/photos/{filename}")
+def delete_player_photo(player_id: int, filename: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    player = _photo_player(player_id, current_user, db)
+    name = _safe_photo_name(filename)
+    folder = _player_folder(player)
+    path = os.path.join(folder, name) if folder else None
+
+    if path is None or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    os.remove(path)
+
+    print("[PHOTOS]", current_user.username, "deleted", name, "for", player.name)
+
+    return {"message": "Photo deleted"}
+
+
+# ---------- previous injury history (output/injury_history.json) ----------
+# Past injuries typed in by a coach (own team) or admin.
+# Medical staff and admin see every player; a coach sees their own team.
+
+INJURY_HISTORY_FILE = os.path.join(PROJECT_ROOT, "output", "injury_history.json")
+
+HISTORY_SEVERITIES = ("Minor", "Moderate", "Severe")
+HISTORY_STATUSES = ("Recovered", "Recovering", "Ongoing")
+HISTORY_BODY_AREAS = (
+    "Head", "Neck", "Shoulder", "Arm", "Elbow", "Wrist / Hand", "Chest", "Back",
+    "Hip / Groin", "Thigh", "Hamstring", "Knee", "Lower leg", "Ankle", "Foot", "Other",
+)
+
+
+class InjuryHistoryRequest(BaseModel):
+    injury: str
+    body_area: str
+    injury_date: str                 # YYYY-MM-DD
+    severity: str
+    status: str
+    days_out: Optional[int] = None
+    notes: str = ""
+
+
+def _history_can_view(user: User, player: Player):
+    if user.role in ("medical", "admin"):
+        return True
+    return user.role == "coach" and player.team_id == user.team_id
+
+
+def _history_can_edit(user: User, player: Player):
+    if user.role == "admin":
+        return True
+    return user.role == "coach" and player.team_id == user.team_id
+
+
+def _history_player(player_id: int, user: User, db: Session, edit=False):
+    player = db.query(Player).filter(Player.id == player_id).first()
+    if player is None:
+        raise HTTPException(status_code=404, detail="Player not found")
+    if edit and not _history_can_edit(user, player):
+        raise HTTPException(status_code=403, detail="Only admin or this player's coach can change injury history")
+    if not edit and not _history_can_view(user, player):
+        raise HTTPException(status_code=403, detail="Coaches can only see their own team's injury history")
+    return player
+
+
+def _history_fields(request: InjuryHistoryRequest):
+    fields = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+
+    for key in ("injury", "body_area", "injury_date", "severity", "status"):
+        fields[key] = (fields.get(key) or "").strip()
+        if not fields[key]:
+            raise HTTPException(status_code=400, detail="'" + key.replace("_", " ") + "' is required")
+
+    if len(fields["injury"]) > 120:
+        raise HTTPException(status_code=400, detail="Injury name is limited to 120 characters")
+
+    if fields["body_area"] not in HISTORY_BODY_AREAS:
+        raise HTTPException(status_code=400, detail="Body area must be one of: " + ", ".join(HISTORY_BODY_AREAS))
+
+    if fields["severity"] not in HISTORY_SEVERITIES:
+        raise HTTPException(status_code=400, detail="Severity must be one of: " + ", ".join(HISTORY_SEVERITIES))
+
+    if fields["status"] not in HISTORY_STATUSES:
+        raise HTTPException(status_code=400, detail="Status must be one of: " + ", ".join(HISTORY_STATUSES))
+
+    try:
+        day = datetime.strptime(fields["injury_date"], "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date must be in the format YYYY-MM-DD")
+
+    if day > datetime.now().date():
+        raise HTTPException(status_code=400, detail="The injury date cannot be in the future")
+
+    if fields.get("days_out") is not None and not (0 <= int(fields["days_out"]) <= 1000):
+        raise HTTPException(status_code=400, detail="Days out must be between 0 and 1000")
+
+    fields["notes"] = (fields.get("notes") or "").strip()
+    if len(fields["notes"]) > 1000:
+        raise HTTPException(status_code=400, detail="Notes are limited to 1000 characters")
+
+    return fields
+
+
+def _history_record_out(record, player, user):
+    out = dict(record)
+    out["player_name"] = player.name if player else None
+    out["jersey_number"] = player.jersey_number if player else None
+    out["team_id"] = player.team_id if player else None
+    out["team_name"] = player.team.name if player is not None and player.team is not None else None
+    out["can_edit"] = bool(player) and _history_can_edit(user, player)
+    return out
+
+
+@app.get("/injury-history")
+def list_injury_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    records = _load_json(INJURY_HISTORY_FILE, [])
+    players = {p.id: p for p in db.query(Player).all()}
+
+    result = []
+    for r in records:
+        player = players.get(r.get("player_id"))
+        if player is not None and _history_can_view(current_user, player):
+            result.append(_history_record_out(r, player, current_user))
+
+    result.sort(key=lambda r: (r.get("injury_date") or "", r.get("id") or 0), reverse=True)
+    return result
+
+
+@app.post("/players/{player_id}/injury-history")
+def add_injury_history(player_id: int, request: InjuryHistoryRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    player = _history_player(player_id, current_user, db, edit=True)
+    fields = _history_fields(request)
+
+    records = _load_json(INJURY_HISTORY_FILE, [])
+    next_id = max([int(r.get("id") or 0) for r in records] + [0]) + 1
+
+    record = dict(fields)
+    record["id"] = next_id
+    record["player_id"] = player.id
+    record["added_by"] = current_user.username
+    record["added_at"] = _now_utc().isoformat()
+
+    records.append(record)
+    _save_json(INJURY_HISTORY_FILE, records)
+
+    print("[HISTORY]", current_user.username, "added", fields["injury"], "for", player.name)
+
+    return {"message": "Injury added", "record": _history_record_out(record, player, current_user)}
+
+
+@app.put("/injury-history/{record_id}")
+def update_injury_history(record_id: int, request: InjuryHistoryRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    records = _load_json(INJURY_HISTORY_FILE, [])
+    record = next((r for r in records if r.get("id") == record_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Injury record not found")
+
+    player = _history_player(record.get("player_id"), current_user, db, edit=True)
+    record.update(_history_fields(request))
+    record["updated_by"] = current_user.username
+    record["updated_at"] = _now_utc().isoformat()
+
+    _save_json(INJURY_HISTORY_FILE, records)
+
+    return {"message": "Injury updated", "record": _history_record_out(record, player, current_user)}
+
+
+@app.delete("/injury-history/{record_id}")
+def delete_injury_history(record_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+    records = _load_json(INJURY_HISTORY_FILE, [])
+    record = next((r for r in records if r.get("id") == record_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Injury record not found")
+
+    player = _history_player(record.get("player_id"), current_user, db, edit=True)
+    _save_json(INJURY_HISTORY_FILE, [r for r in records if r.get("id") != record_id])
+
+    print("[HISTORY]", current_user.username, "deleted", record.get("injury"), "for", player.name)
+
+    return {"message": "Injury deleted"}

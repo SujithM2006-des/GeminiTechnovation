@@ -3,7 +3,10 @@ import { Link, NavLink, Navigate, Outlet, useNavigate } from 'react-router-dom'
 import { LayoutDashboard, Users, Shield, CalendarDays, Activity, Zap, Bell, FileText, UserCog, Server, Settings, Menu, PanelLeft, Search, LogOut, HelpCircle, ChevronDown, type LucideIcon } from 'lucide-react'
 import { useAuth, home } from './auth'
 import type { Role } from './types'
-import { useEvents } from './queries'
+import { useQueryClient } from '@tanstack/react-query'
+import { useAlertReads, useEvents } from './queries'
+import { usePrefs } from './prefs'
+import { markAlertsRead } from './api/services'
 import { Badge, RiskBadge } from './ui'
 
 type N = { label: string; to: string; icon: LucideIcon }
@@ -22,8 +25,9 @@ export const navFor = (r: Role): N[] => {
   // the other pages still open from links inside events.
   const adminCommon = common().filter((i) => i.to !== '/players' && i.to !== '/matches' && i.to !== '/collisions')
   if (r === 'ADMIN') return [dash, { label: 'Teams & Players', to: '/teams', icon: Shield }, ...adminCommon, rep, { label: 'Users', to: '/admin/users', icon: UserCog }, { label: 'System', to: '/admin/system', icon: Server }, set]
-  if (r === 'MEDICAL') return [dash, ...common(), rep, set]
-  return [dash, { label: 'My Team', to: '/teams', icon: Shield }, ...common(), set]
+  // Medical staff and coaches: same short menu as admin (Players, Matches and Collisions are reached from
+  // inside "Team & Players" and the events), plus Reports.
+  return [dash, { label: r === 'COACH' ? 'Team & Players' : 'Teams & Players', to: '/teams', icon: Shield }, ...adminCommon, rep, set]
 }
 
 export default function Layout() {
@@ -35,10 +39,26 @@ export default function Layout() {
   const [menu, setMenu] = useState(false)
   const [q, setQ] = useState('')
   const events = useEvents()
+  // Medical staff and coaches: the bell shows their unread alerts (Settings > Notifications picks the levels).
+  // Admin: unchanged, every high-risk event.
+  const staff = !!user && user.role !== 'ADMIN' && !user.dev
+  const reads = useAlertReads(staff)
+  const prefs = usePrefs(user?.name)
+  const qc = useQueryClient()
   if (!user) return <Navigate to="/login" replace />
 
   const items = navFor(user.role)
-  const high = (events.data ?? []).filter((e) => e.risk === 'HIGH')
+  const RISKS = ['HIGH', 'MEDIUM', 'LOW']
+  const readIds = new Set(reads.data ?? [])
+  const high = staff
+    ? (events.data ?? []).filter((e) => prefs.alertRisks.includes(e.risk ?? 'LOW') && !readIds.has(e.id))
+      .sort((a, b) => RISKS.indexOf(a.risk ?? 'LOW') - RISKS.indexOf(b.risk ?? 'LOW') || +new Date(b.timestamp) - +new Date(a.timestamp))
+    : (events.data ?? []).filter((e) => e.risk === 'HIGH')
+  const markRead = (ids: number[]) => {
+    if (!staff || !ids.length) return
+    qc.setQueryData(['alertReads'], [...readIds, ...ids])
+    markAlertsRead(ids).then((all) => qc.setQueryData(['alertReads'], all)).catch(() => qc.invalidateQueries({ queryKey: ['alertReads'] }))
+  }
   const search = (e: FormEvent) => { e.preventDefault(); nav(`/events?q=${encodeURIComponent(q)}`) }
 
   const side = (mobile: boolean) => (
@@ -63,7 +83,7 @@ export default function Layout() {
           <button aria-label="Collapse sidebar" className="hidden lg:block" onClick={() => setCollapsed((c) => !c)}><PanelLeft /></button>
           <form onSubmit={search} className="relative max-w-md flex-1" role="search"><Search size={16} className="absolute left-3 top-2.5 text-slate-400" /><input aria-label="Search events, players" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search players, events…" className="w-full rounded-lg border border-slate-300 py-2 pl-9 pr-3 text-sm" /></form>
           <div className="relative ml-auto">
-            <button aria-label={`Notifications, ${high.length} high-risk`} onClick={() => { setBell((b) => !b); setMenu(false) }} className="relative rounded-lg p-2 hover:bg-slate-100">
+            <button aria-label={`Notifications, ${high.length} ${staff ? 'unread' : 'high-risk'}`} onClick={() => { setBell((b) => !b); setMenu(false) }} className="relative rounded-lg p-2 hover:bg-slate-100">
               <Bell size={20} />
               {high.length > 0 && <span className="absolute -right-0.5 -top-0.5 grid h-5 min-w-5 place-items-center rounded-full bg-red-600 px-1 text-[10px] font-bold text-white">{high.length > 99 ? '99+' : high.length}</span>}
             </button>
@@ -72,10 +92,11 @@ export default function Layout() {
                 <p className="font-semibold">Notifications</p>
                 {high.length === 0 ? <p className="py-4 text-center text-slate-500">No unread alerts</p> : (
                   <ul className="mt-2 divide-y divide-slate-100">{high.slice(0, 5).map((e) => (
-                    <li key={e.id}><Link to={`/events/${e.id}`} onClick={() => setBell(false)} className="flex items-center justify-between gap-2 rounded-lg px-2 py-2 hover:bg-slate-50"><span className="truncate">{e.player.name ?? 'Unidentified'} · {e.region ?? '—'}</span><RiskBadge level={e.risk} /></Link></li>
+                    <li key={e.id}><Link to={`/events/${e.id}`} onClick={() => { setBell(false); markRead([e.id]) }} className="flex items-center justify-between gap-2 rounded-lg px-2 py-2 hover:bg-slate-50"><span className="truncate">{e.player.name ?? 'Unidentified'} · {e.region ?? '—'}</span><RiskBadge level={e.risk} /></Link></li>
                   ))}</ul>
                 )}
                 <button className="mt-2 inline-flex w-full items-center justify-center rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50" onClick={() => { setBell(false); nav('/alerts') }}>View all alerts</button>
+                {staff && high.length > 0 && <button className="mt-2 w-full text-center text-xs text-slate-500 underline hover:text-slate-700" onClick={() => markRead(high.map((e) => e.id))}>Mark all {high.length} as read</button>}
               </div>
             )}
           </div>
