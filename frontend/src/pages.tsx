@@ -6,12 +6,12 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { Shield, Eye, EyeOff, Plus, Play, Pause, Square, RotateCcw, Maximize, Upload, VideoOff, CheckCheck, Download, RefreshCw, WifiOff, Lock, FileQuestion, ServerCrash, Cpu, ChevronRight, ChevronDown, ClipboardPlus, Trash2, Sparkles, UserCheck, History, ExternalLink, ImageOff, CheckCircle2, Pencil, Loader2, Activity, Bell, Zap, FileText, CalendarDays, Users, HeartPulse, type LucideIcon } from 'lucide-react'
 import { useAuth, home } from './auth'
-import { addInjuryHistory, assignPlayer, changePassword, clearAllEvents, createUser, deleteInjuryHistory, deletePlayerPhoto, deleteUser, getAssessment, getMe, getPlayerPhotoBlob, getPlayerPhotos, getSystemStatus, getUsers, logManualEvent, markAlertsRead, reopenEvent, resolveEvent, saveAssessment, updateInjuryHistory, uploadPlayerPhoto, type AssessmentInput, type InjuryHistoryInput } from './api/services'
+import { addInjuryHistory, assignPlayer, clearAllEvents, createUser, deleteInjuryHistory, deletePlayerPhoto, deleteUser, getAssessment, getMe, getPlayerPhotoBlob, getPlayerPhotos, getSystemStatus, getUsers, logManualEvent, markAlertsRead, reopenEvent, resolveEvent, saveAssessment, updateInjuryHistory, uploadPlayerPhoto, type AssessmentInput, type InjuryHistoryInput } from './api/services'
 import { normalizeApiError } from './api/client'
 import type { AppUser } from './api/mappers'
 import type { AssessmentDto, DetectorInfoDto, DetectorProgressDto, InjuryHistoryDto, SystemDto } from './api/dto'
 import { useAlertReads, useAssessments, useDetector, useEvents, useInjuryHistory, useMatches, usePlayers, useTeams } from './queries'
-import { DEFAULT_PREFS, dateOptions, savePrefs, usePrefs, type Prefs } from './prefs'
+import { dateOptions } from './prefs'
 import type { InjuryEvent, Player, RiskLevel, Role } from './types'
 import { safetyMeasures, SAFETY_DISCLAIMER } from './safety'
 import { Badge, Card, Confirm, Disclaimer, EmptyState, ErrorState, Field, IdentityBadge, Modal, Na, PageHeader, RiskBadge, SafetyMeasures, Skeleton, btn, btnD, btnP, btnS, inp, inpAuto, useToast, type Tone } from './ui'
@@ -340,8 +340,10 @@ function PreviousInjuries({ playerId, name }: { playerId: number; name: string }
 }
 
 /** Coach dashboard: the team's previous injury history, one row per player. */
-function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
+function TeamInjuryHistory({ teamId, allTeams = false }: { teamId?: number | null; allTeams?: boolean }) {
   const { user } = useAuth()
+  const viewOnly = user?.role === 'MEDICAL'
+  const [teamF, setTeamF] = useState('')
   const allPlayers = usePlayers().data ?? []
   const h = useInjuryHistory()
   const ev = useEvents()
@@ -349,7 +351,8 @@ function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
   const [adding, setAdding] = useState(false)
   const [q, setQ] = useState('')
   const [onlyWith, setOnlyWith] = useState(false)
-  const team = allPlayers.filter((p) => p.teamId === teamId)
+  const team = allTeams ? allPlayers : allPlayers.filter((p) => p.teamId === teamId)
+  const teamNames = [...new Set(allPlayers.map((p) => p.teamName ?? '').filter(Boolean))].sort()
   const records = h.data ?? []
   const dev = !!user?.dev
   const statusRank = (s?: string) => (s === 'Ongoing' ? 0 : s === 'Recovering' ? 1 : 2)
@@ -362,6 +365,7 @@ function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
   })
     .filter((r) => !needle || `${r.p.name} ${r.p.jersey}`.toLowerCase().includes(needle))
     .filter((r) => !onlyWith || r.mine.length > 0)
+    .filter((r) => !teamF || r.p.teamName === teamF)
     .sort((a, b) => b.active - a.active || statusRank(a.latest?.status) - statusRank(b.latest?.status) || b.mine.length - a.mine.length || a.p.jersey - b.p.jersey)
 
   const teamRecords = records.filter((r) => team.some((p) => p.id === r.player_id))
@@ -377,25 +381,26 @@ function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
       <div className="flex flex-wrap items-center gap-3 border-b border-slate-200 p-5">
         <div className="mr-auto">
           <h2 className="flex items-center gap-2 font-semibold"><HeartPulse size={18} className="text-rose-600" />Previous injury history</h2>
-          <p className="text-xs text-slate-500">Past injuries of your players. Click a name to see the full history and the falls the detector found.</p>
+          <p className="text-xs text-slate-500">{allTeams ? 'Past injuries of every player.' : 'Past injuries of your players.'} Click a name to see the full history and the falls the detector found.</p>
         </div>
-        <button className={btnP} disabled={dev || team.length === 0} onClick={() => setAdding(true)}><Plus size={16} />Add injury</button>
+        {viewOnly ? <Badge tone="gray">View only</Badge> : <button className={btnP} disabled={dev || team.length === 0} onClick={() => setAdding(true)}><Plus size={16} />Add injury</button>}
       </div>
       <div className="grid grid-cols-2 gap-3 border-b border-slate-200 p-5 lg:grid-cols-4">
         {stats.map(([l, v, t]) => <div key={l} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{l}</p>{h.isLoading ? <Skeleton className="mt-2 h-7 w-10" /> : <p className={`mt-1 text-2xl font-bold ${t}`}>{v}</p>}</div>)}
       </div>
       <div className="flex flex-wrap items-center gap-3 px-5 pt-4">
         <input aria-label="Search players" className={inpAuto + ' w-full sm:w-64'} placeholder="Search players…" value={q} onChange={(e) => { setQ(e.target.value); setOpen(null) }} />
+        {allTeams && <select aria-label="Filter by team" className={inpAuto} value={teamF} onChange={(e) => { setTeamF(e.target.value); setOpen(null) }}><option value="">All teams</option>{teamNames.map((t) => <option key={t} value={t}>{t}</option>)}</select>}
         <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={onlyWith} onChange={(e) => setOnlyWith(e.target.checked)} />Only players with previous injuries</label>
       </div>
-      {dev ? <EmptyState title="No data in preview" text="Log in with a coach account to see and add injury history." />
+      {dev ? <EmptyState title="No data in preview" text="Log in with a real account to see injury history." />
         : h.isError ? <ErrorState title="Unable to load injury history" text={normalizeApiError(h.error)} onRetry={() => h.refetch()} />
         : (h.isLoading || !allPlayers.length) ? <div className="space-y-2 p-5"><Skeleton /><Skeleton /><Skeleton /></div>
         : (
           <div className="mt-3 overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="bg-slate-50 text-xs uppercase text-slate-500">
-                <tr><th className={th + ' w-16'}>#</th><th className={th}>Player</th><th className={th}>Previous injuries</th><th className={th}>Latest injury</th><th className={th}>Status</th><th className={th}>Detected falls</th></tr>
+                <tr><th className={th + ' w-16'}>#</th><th className={th}>Player</th>{allTeams && <th className={th}>Team</th>}<th className={th}>Previous injuries</th><th className={th}>Latest injury</th><th className={th}>Status</th><th className={th}>Detected falls</th></tr>
               </thead>
               <tbody>
                 {rows.map(({ p, mine, latest, falls }) => (
@@ -403,20 +408,21 @@ function TeamInjuryHistory({ teamId }: { teamId: number | null }) {
                     <tr className={`border-t border-slate-100 ${open === p.id ? 'bg-slate-50' : latest && latest.status !== 'Recovered' ? 'bg-amber-50/40 hover:bg-amber-50' : 'hover:bg-slate-50'}`}>
                       <td className="px-4 py-3"><span className="grid h-8 w-8 place-items-center rounded-full bg-slate-100 text-xs font-bold text-slate-700">{p.jersey}</span></td>
                       <td className="px-4 py-3"><PlayerToggle open={open === p.id} onClick={() => setOpen(open === p.id ? null : p.id)}>{p.name}</PlayerToggle></td>
+                      {allTeams && <td className="px-4 py-3 text-slate-600">{p.teamName ?? '—'}</td>}
                       <td className="px-4 py-3">{mine.length > 0 ? <span className="font-semibold">{mine.length}</span> : <span className="text-slate-400">0</span>}</td>
                       <td className="px-4 py-3">{latest ? <><p className="font-medium">{latest.injury}</p><p className="text-xs text-slate-500">{latest.body_area} · {fmtDay(latest.injury_date)}</p></> : <span className="text-slate-400">—</span>}</td>
                       <td className="px-4 py-3">{latest ? <Badge tone={HSTATUS_TONE[latest.status] ?? 'gray'}>{latest.status}</Badge> : <span className="text-slate-400">—</span>}</td>
                       <td className="px-4 py-3">{falls > 0 ? <span className="font-semibold">{falls}</span> : <span className="text-slate-400">0</span>}</td>
                     </tr>
-                    {open === p.id && <tr><td colSpan={6} className="p-0"><PlayerHistory playerId={p.id} name={p.name} /></td></tr>}
+                    {open === p.id && <tr><td colSpan={allTeams ? 7 : 6} className="p-0"><PlayerHistory playerId={p.id} name={p.name} /></td></tr>}
                   </Fragment>
                 ))}
               </tbody>
             </table>
-            {rows.length === 0 && <EmptyState title="No players found" text={onlyWith ? 'No players with previous injuries yet. Use "Add injury" to record one.' : 'No players match your search.'} />}
+            {rows.length === 0 && <EmptyState title="No players found" text={onlyWith ? (viewOnly ? 'No players with previous injuries yet.' : 'No players with previous injuries yet. Use "Add injury" to record one.') : 'No players match your search.'} />}
           </div>
         )}
-      {adding && <InjuryHistoryModal players={team} onClose={() => setAdding(false)} />}
+      {adding && !viewOnly && <InjuryHistoryModal players={team} onClose={() => setAdding(false)} />}
     </Card>
   )
 }
@@ -540,6 +546,8 @@ const QA: Record<Role, [string, string][]> = {
   COACH: [['My team', '/teams'], ['View matches', '/matches'], ['View alerts', '/alerts']],
   MEDICAL: [['Review queue', '/events'], ['Collisions', '/collisions'], ['Reports', '/reports']],
 }
+/** KPI cards fill the full width whatever their count (Tailwind needs the full class names written out) */
+const KPI_COLS: Record<number, string> = { 4: 'lg:grid-cols-4', 5: 'lg:grid-cols-5', 6: 'lg:grid-cols-3 xl:grid-cols-6' }
 const byRisk = (a: InjuryEvent, b: InjuryEvent) => ['HIGH', 'MEDIUM', 'LOW'].indexOf(a.risk ?? 'LOW') - ['HIGH', 'MEDIUM', 'LOW'].indexOf(b.risk ?? 'LOW')
 
 export function Dashboard({ role }: { role: Role }) {
@@ -547,7 +555,6 @@ export function Dashboard({ role }: { role: Role }) {
   const ev = useEvents()
   const teams = useTeams()
   const players = usePlayers()
-  const matches = useMatches()
   const assessments = useAssessments(role === 'MEDICAL')
   const toast = useToast()
   const refresh = useRefreshAll()
@@ -559,12 +566,11 @@ export function Dashboard({ role }: { role: Role }) {
   const open = list.filter((e) => !e.resolved)
   const unidentified = list.filter((e) => !e.identified)
   const myTeam = role === 'COACH' ? (teams.data ?? [])[0] : undefined
-  const latestMatch = (matches.data ?? [])[0]
 
   // Same KPI cards as the design; "—" where the backend has no data for it.
   const KPI: Record<Role, [string, number | string | null, string?][]> = {
-    ADMIN: [['Total teams', teams.data?.length ?? null], ['Total players', players.data?.length ?? null], ['Active matches', matches.data?.length ?? null], ['Total incidents', ev.data ? list.length : null], ['High-risk incidents', ev.data ? list.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Pending medical reviews', ev.data ? open.length : null, 'text-amber-600']],
-    COACH: [['Players in my team', myTeam?.playerCount ?? null], ['Active match', latestMatch?.name ?? null], ['Recent incidents', myTeam?.injuryEvents ?? null], ['High-risk alerts', myTeam?.highRiskEvents ?? null, 'text-red-700'], ['Players needing attention', myTeam ? myTeam.players.filter((p) => p.highRiskEvents > 0).length : null, 'text-amber-600']],
+    ADMIN: [['Total teams', teams.data?.length ?? null], ['Total players', players.data?.length ?? null], ['Total incidents', ev.data ? list.length : null], ['High-risk incidents', ev.data ? list.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Pending medical reviews', ev.data ? open.length : null, 'text-amber-600']],
+    COACH: [['Players in my team', myTeam?.playerCount ?? null], ['Recent incidents', myTeam?.injuryEvents ?? null], ['High-risk alerts', myTeam?.highRiskEvents ?? null, 'text-red-700'], ['Players needing attention', myTeam ? myTeam.players.filter((p) => p.highRiskEvents > 0).length : null, 'text-amber-600']],
     MEDICAL: [['Pending reviews', ev.data ? open.length : null], ['High priority', ev.data ? open.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Medium priority', ev.data ? open.filter((e) => e.risk === 'MEDIUM').length : null, 'text-amber-600'], ['Low priority', ev.data ? open.filter((e) => e.risk === 'LOW').length : null, 'text-green-700'], ['Assessments saved', assessments.data ? assessments.data.length : null]],
   }
 
@@ -582,25 +588,14 @@ export function Dashboard({ role }: { role: Role }) {
         : <ul className="mt-2 divide-y divide-slate-100">{highList.slice(0, 4).map((e) => <EventLine key={e.id} e={e} />)}</ul>}
     </Card>
   )
-
-  // Medical staff: big Quick action buttons (the admin dashboard keeps its own controls; coaches get the injury history instead)
-  type BigAction = { label: string; hint: string; icon: LucideIcon; to?: string; onClick?: () => void; count?: number; primary?: boolean; disabled?: boolean }
-  const bigActions: BigAction[] = role === 'MEDICAL' ? [
-    { label: 'Review queue', hint: `${open.length} incident(s) waiting for review`, icon: Activity, to: '/events', count: open.length, primary: true },
-    { label: 'Log manual event', hint: 'Record an injury seen by staff', icon: ClipboardPlus, onClick: () => setLogOpen(true), disabled: dev },
-    { label: 'Identify players', hint: 'Watch the clip and pick who fell', icon: UserCheck, to: '/events?identity=unidentified', count: unidentified.length },
-    { label: 'Alerts', hint: 'High, medium and low priority', icon: Bell, to: '/alerts', count: highList.filter((e) => !e.resolved).length },
-    { label: 'Teams & Players', hint: 'Rosters, injury history, reference photos', icon: Users, to: '/teams' },
-    { label: 'Reports', hint: 'Download the injury report as PDF', icon: FileText, to: '/reports' },
-  ] : []
-    return (
+      return (
     <>
       <PageHeader back={false} title={`${role.charAt(0) + role.slice(1).toLowerCase()} dashboard`} crumbs={[{ label: 'Dashboard' }]}
         actions={role !== 'ADMIN' && <>
           <Link to="/reports" className={btnS}><FileText size={16} />Reports</Link>
           {role === 'MEDICAL' && <button className={btnP} disabled={dev} onClick={() => setLogOpen(true)}><ClipboardPlus size={16} />Log manual event</button>}
         </>} />
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
+      <div className={`grid grid-cols-2 gap-3 ${KPI_COLS[KPI[role].length] ?? 'lg:grid-cols-3 xl:grid-cols-6'}`}>
         {KPI[role].map(([k, v, t]) => <Card key={k}><p className="text-xs text-slate-500">{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-lg' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
       </div>
       {dev && <p className="mt-2 text-xs text-slate-500">Metrics are shown only when real backend data is available.</p>}
@@ -651,33 +646,11 @@ export function Dashboard({ role }: { role: Role }) {
           </div>
           {/* Coach: previous injury history across the full width */}
           {role === 'COACH' ? <div className="mt-4"><TeamInjuryHistory teamId={user?.teamId ?? myTeam?.id ?? null} /></div> : (
-          /* Medical: Recent alerts (left) | big Quick actions (right) */
-          <div className="mt-4 grid gap-4 lg:grid-cols-2">
-            {recentAlerts}
-            <Card className="flex flex-col">
-              <h2 className="font-semibold">Quick actions</h2>
-              <div className="mt-3 grid flex-1 auto-rows-fr grid-cols-1 gap-3 sm:grid-cols-2">
-                {bigActions.map((a) => {
-                  const body = (
-                    <>
-                      <span className="flex w-full items-start justify-between gap-2">
-                        <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl ${a.primary ? 'bg-white/15 text-white' : 'bg-[#0b1f3a] text-white'}`}><a.icon size={22} /></span>
-                        {a.count !== undefined && a.count > 0 && <span className={`rounded-full px-2.5 py-0.5 text-sm font-bold ${a.primary ? 'bg-white text-[#0b1f3a]' : 'bg-red-600 text-white'}`}>{a.count}</span>}
-                      </span>
-                      <span>
-                        <span className="block text-base font-semibold">{a.label}</span>
-                        <span className={`block text-xs ${a.primary ? 'text-slate-200' : 'text-slate-500'}`}>{a.hint}</span>
-                      </span>
-                    </>
-                  )
-                  const cls = `flex min-h-28 flex-col justify-between gap-3 rounded-xl border p-4 text-left transition hover:-translate-y-0.5 hover:shadow-md disabled:pointer-events-none disabled:opacity-50 ${a.primary ? 'border-[#0b1f3a] bg-[#0b1f3a] text-white hover:bg-[#16325c]' : 'border-slate-200 bg-slate-50 text-slate-800 hover:border-[#0b1f3a] hover:bg-white'}`
-                  return a.to
-                    ? <Link key={a.label} to={a.to} className={cls}>{body}</Link>
-                    : <button key={a.label} type="button" className={cls} disabled={a.disabled} onClick={a.onClick}>{body}</button>
-                })}
-              </div>
-            </Card>
-          </div>
+          /* Medical: Recent alerts, then the previous injury history of every player (view only) */
+          <>
+            <div className="mt-4">{recentAlerts}</div>
+            <div className="mt-4"><TeamInjuryHistory allTeams /></div>
+          </>
           )}
         </>
       )}
@@ -1188,7 +1161,6 @@ function TeamsHub() {
     </>
   )
 }
-
 /** Reports and users: the backend has no data for these, so the design's empty table is shown. */
 function StaticList({ k, onCreate }: { k: string; onCreate?: () => void }) {
   const cols = k === 'reports' ? ['Report', 'Event', 'Generated', 'Version', 'Actions'] : ['Name', 'Role', 'Team', 'Status']
@@ -1687,7 +1659,6 @@ export function Assessment() {
     </>
   )
 }
-
 /* ---------- ALERTS (built from the events feed: priority = risk, unread = not resolved) ---------- */
 export function Alerts() {
   const { user } = useAuth()
@@ -1957,7 +1928,6 @@ function AssessmentCard({ e, a, loading }: { e: InjuryEvent; a: AssessmentDto | 
 /* ---------- alerts with a per-user read state ---------- */
 function StaffAlerts() {
   const { user } = useAuth()
-  const prefs = usePrefs(user?.name)
   const [pri, setPri] = useState('All')
   const [read, setRead] = useState('All')
   const [busy, setBusy] = useState(false)
@@ -1967,8 +1937,7 @@ function StaffAlerts() {
   const markRead = useMarkRead()
   const readSet = new Set(reads.data ?? [])
   const all = ev.data ?? []
-  const shown = all.filter((e) => prefs.alertRisks.includes(e.risk ?? 'LOW'))
-  const hidden = all.length - shown.length
+  const shown = all
   const unread = shown.filter((e) => !readSet.has(e.id))
   const list = shown
     .filter((e) => (pri === 'All' || e.risk === pri.toUpperCase()) && (read === 'All' || (read === 'Unread' ? !readSet.has(e.id) : readSet.has(e.id))))
@@ -2001,98 +1970,124 @@ function StaffAlerts() {
               </li>
             )
           })}</ul>}
-        {hidden > 0 && <p className="border-t px-4 py-3 text-xs text-slate-500">{hidden} alert(s) hidden by your notification settings. <Link to="/settings?tab=Notifications" className="text-blue-700 underline">Change</Link></p>}
       </Card>
     </>
   )
 }
 
-/* ---------- settings: profile, time format, which alerts to show, change password ---------- */
-const pwSchema = z.object({
-  current: z.string().min(1, 'Enter your current password'),
-  next: z.string().min(6, 'New password must be at least 6 characters').max(72, 'New password must be 72 characters or fewer'),
-  confirm: z.string(),
-}).refine((v) => v.next === v.confirm, { path: ['confirm'], message: 'Passwords do not match' })
-  .refine((v) => v.next !== v.current, { path: ['next'], message: 'New password must be different from the current one' })
+/* ---------- settings (medical staff and coaches): a full-page profile. Only the admin can change these details. ---------- */
+const ROLE_ACCESS: Record<Role, string[]> = {
+  ADMIN: [],
+  COACH: [
+    'See your own team\'s incidents and every unidentified fall',
+    'Identify the player in an unidentified fall from its clip',
+    'Add and edit your players\' previous injury history',
+    'Upload reference photos of your players',
+    'Download the injury report as PDF',
+  ],
+  MEDICAL: [
+    'Review every incident from both teams',
+    'Record medical assessments and mark incidents as reviewed',
+    'Log manual events seen by staff',
+    'Correct the identified player of any fall',
+    'Download the injury report as PDF',
+  ],
+}
 
 function StaffSettings() {
   const { user } = useAuth()
-  const toast = useToast()
-  const [sp, setSp] = useSearchParams()
-  const TABS = ['Profile', 'Preferences', 'Notifications', 'Security']
-  const tab = TABS.includes(sp.get('tab') ?? '') ? sp.get('tab')! : 'Profile'
-  const setTab = (t: string) => setSp(t === 'Profile' ? {} : { tab: t }, { replace: true })
   const me = useQuery({ queryKey: ['me'], queryFn: getMe })
-  const saved = usePrefs(user?.name)
-  const [draft, setDraft] = useState<Prefs | null>(null)
-  const p = draft ?? saved
-  const [show, setShow] = useState(false)
-  const [pwErr, setPwErr] = useState('')
-  const f = useForm<z.infer<typeof pwSchema>>({ resolver: zodResolver(pwSchema), defaultValues: { current: '', next: '', confirm: '' } })
+  const teams = useTeams()
+  const ev = useEvents()
+  const assessments = useAssessments(user?.role === 'MEDICAL')
+  if (!user) return null
 
-  const savePref = () => {
-    if (!user) return
-    if (!p.alertRisks.length) { toast('Pick at least one alert level.', true); return }
-    savePrefs(user.name, p)
-    setDraft(null)
-    toast('Settings saved.')
-  }
-  const toggleRisk = (r: RiskLevel) => setDraft({ ...p, alertRisks: p.alertRisks.includes(r) ? p.alertRisks.filter((x) => x !== r) : [...p.alertRisks, r] })
-  const changePw = f.handleSubmit(async (v) => {
-    setPwErr('')
-    try {
-      await changePassword(v.current, v.next)
-      f.reset()
-      toast('Password changed. Use the new password next time you log in.')
-    } catch (x) {
-      setPwErr(normalizeApiError(x))
-    }
-  })
-  const example = new Date().toLocaleString(undefined, p.timeFormat ? { hour12: p.timeFormat === '12h' } : undefined)
-  const pw = (n: 'current' | 'next' | 'confirm', label: string, auto: string) => (
-    <Field label={label} err={f.formState.errors[n]?.message}><input type={show ? 'text' : 'password'} autoComplete={auto} className={inp} {...f.register(n)} /></Field>
+  const coach = user.role === 'COACH'
+  const name = me.data?.username ?? user.name
+  const teamName = me.data?.teamName ?? null
+  const myTeam = coach ? (teams.data ?? [])[0] : undefined
+  const events = ev.data ?? []
+  const mySaved = (assessments.data ?? []).filter((a) => a.saved_by === name)
+
+  const Info = ({ label, value }: { label: string; value: ReactNode }) => (
+    <div className="flex items-center justify-between gap-4 border-b border-slate-100 py-3.5 last:border-0">
+      <dt className="text-sm text-slate-500">{label}</dt>
+      <dd className="flex items-center gap-2 text-right text-sm font-semibold text-slate-800">{value}<Lock size={13} className="shrink-0 text-slate-300" aria-label="Set by the administrator" /></dd>
+    </div>
   )
+  const Stat = ({ label, value, tone = '' }: { label: string; value: ReactNode; tone?: string }) => (
+    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs text-slate-500">{label}</p><p className={`mt-1 text-2xl font-bold ${tone}`}>{value}</p></div>
+  )
+
+  const stats: [string, ReactNode, string?][] = coach
+    ? [
+        ['Players in your team', myTeam ? myTeam.playerCount : '—'],
+        ['Team incidents', myTeam ? myTeam.injuryEvents : '—'],
+        ['High-risk incidents', myTeam ? myTeam.highRiskEvents : '—', 'text-red-700'],
+        ['Unidentified falls', ev.data ? events.filter((e) => !e.identified).length : '—', 'text-amber-600'],
+      ]
+    : [
+        ['Waiting for review', ev.data ? events.filter((e) => !e.resolved).length : '—', 'text-amber-600'],
+        ['High priority open', ev.data ? events.filter((e) => !e.resolved && e.risk === 'HIGH').length : '—', 'text-red-700'],
+        ['Assessments you saved', assessments.data ? mySaved.length : '—'],
+        ['Incidents reviewed', ev.data ? events.filter((e) => e.resolved).length : '—', 'text-green-700'],
+      ]
 
   return (
     <>
-      <PageHeader title="Settings" crumbs={[{ label: 'Settings' }]} />
-      <div role="tablist" className="mb-4 flex gap-1 overflow-x-auto border-b">{TABS.map((t) => <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm ${tab === t ? 'border-b-2 border-[#0b1f3a] font-semibold' : 'text-slate-500'}`}>{t}</button>)}</div>
-      <Card className="max-w-xl space-y-3">
-        {tab === 'Profile' && (
-          <>
-            <Field label="Username"><input className={inp + ' bg-slate-50'} value={me.data?.username ?? user?.name ?? ''} readOnly /></Field>
-            <Field label="Role"><input className={inp + ' bg-slate-50'} value={user ? ROLE_LABEL[user.role] : ''} readOnly /></Field>
-            {user?.role === 'COACH' && <Field label="Team"><input className={inp + ' bg-slate-50'} value={me.isLoading ? 'Loading…' : me.data?.teamName ?? '—'} readOnly /></Field>}
-            {me.isError && <p className="text-sm text-red-700">{normalizeApiError(me.error)}</p>}
-            <p className="text-xs text-slate-500">Your username, role{user?.role === 'COACH' ? ' and team' : ''} are set by the administrator. You can change your password under Security.</p>
-          </>
-        )}
-        {tab === 'Preferences' && (
-          <>
-            <Field label="Time format"><select className={inp} value={p.timeFormat} onChange={(e) => setDraft({ ...p, timeFormat: e.target.value as Prefs['timeFormat'] })}><option value="">This computer's default</option><option value="24h">24-hour</option><option value="12h">12-hour (AM/PM)</option></select></Field>
-            <p className="text-sm text-slate-600">Example: <b>{example}</b></p>
-            <div className="flex gap-2"><button className={btnP} disabled={!draft} onClick={savePref}>Save changes</button>{draft && <button className={btnS} onClick={() => setDraft(null)}>Cancel</button>}</div>
-          </>
-        )}
-        {tab === 'Notifications' && (
-          <>
-            <p className="text-sm text-slate-600">Choose which alerts appear in Alerts and in the bell at the top of the page.</p>
-            {([['HIGH', 'High-risk alerts'], ['MEDIUM', 'Medium-risk alerts'], ['LOW', 'Low-risk alerts']] as [RiskLevel, string][]).map(([r, l]) => <label key={r} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={p.alertRisks.includes(r)} onChange={() => toggleRisk(r)} />{l}</label>)}
-            {!p.alertRisks.length && <p className="text-sm text-red-700">Pick at least one alert level.</p>}
-            <div className="flex gap-2"><button className={btnP} disabled={!draft || !p.alertRisks.length} onClick={savePref}>Save changes</button>{draft && <button className={btnS} onClick={() => setDraft(null)}>Cancel</button>}<button className={btnS + ' ml-auto'} onClick={() => setDraft({ ...p, alertRisks: [...DEFAULT_PREFS.alertRisks] })}>Show all</button></div>
-            <p className="text-xs text-slate-500">Saved in this browser for {user?.name}.</p>
-          </>
-        )}
-        {tab === 'Security' && (
-          <form className="space-y-3" noValidate onSubmit={changePw}>
-            {pw('current', 'Current password', 'current-password')}
-            {pw('next', 'New password', 'new-password')}
-            {pw('confirm', 'Confirm new password', 'new-password')}
-            <label className="flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={show} onChange={(e) => setShow(e.target.checked)} />Show passwords</label>
-            {pwErr && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm text-red-800">{pwErr}</p>}
-            <button className={btnP} disabled={f.formState.isSubmitting}>{f.formState.isSubmitting ? 'Changing…' : 'Change password'}</button>
-          </form>
-        )}
+      <PageHeader title="Profile" crumbs={[{ label: 'Profile' }]} />
+
+      {/* Header banner across the full width */}
+      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+        <div className="h-28 bg-gradient-to-r from-[#0b1f3a] via-[#16325c] to-sky-600" />
+        <div className="flex flex-wrap items-end gap-5 px-6 pb-6">
+          <span className="-mt-12 grid h-24 w-24 shrink-0 place-items-center rounded-2xl border-4 border-white bg-sky-500 text-4xl font-bold text-white shadow-md">{(name[0] || '?').toUpperCase()}</span>
+          <div className="min-w-0 flex-1 pt-3">
+            <h2 className="truncate text-2xl font-bold">{name}</h2>
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+              <Badge tone={ROLE_TONE[user.role]}>{ROLE_LABEL[user.role]}</Badge>
+              {coach && <span className="flex items-center gap-1"><Shield size={14} />{me.isLoading ? 'Loading team…' : teamName ?? 'No team'}</span>}
+              <span className="flex items-center gap-1"><CheckCircle2 size={14} className="text-green-600" />Active account</span>
+            </div>
+          </div>
+          <p className="flex items-center gap-1.5 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500"><Lock size={13} />Managed by the administrator</p>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-4 lg:grid-cols-3">
+        {/* Personal and account details */}
+        <Card className="lg:col-span-2">
+          <h2 className="font-semibold">Account details</h2>
+          <p className="text-xs text-slate-500">These details are set by the administrator and cannot be changed here.</p>
+          {me.isError && <p role="alert" className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800">{normalizeApiError(me.error)}</p>}
+          <dl className="mt-2">
+            <Info label="Username" value={name} />
+            <Info label="Role" value={ROLE_LABEL[user.role]} />
+            {coach && <Info label="Team" value={me.isLoading ? 'Loading…' : teamName ?? '—'} />}
+            {coach && <Info label="Coach of" value={myTeam ? `${myTeam.playerCount} players` : '—'} />}
+            <Info label="Data you can see" value={coach ? 'Your team + unidentified falls' : 'Both teams'} />
+            <Info label="User ID" value={me.data ? `#${me.data.id}` : '—'} />
+            <Info label="Account status" value={<span className="text-green-700">Active</span>} />
+          </dl>
+        </Card>
+
+        {/* What this role can do */}
+        <Card>
+          <h2 className="font-semibold">What you can do</h2>
+          <p className="text-xs text-slate-500">Access given to the {ROLE_LABEL[user.role].toLowerCase()} role.</p>
+          <ul className="mt-3 space-y-2.5">
+            {ROLE_ACCESS[user.role].map((t) => <li key={t} className="flex items-start gap-2 text-sm text-slate-700"><CheckCircle2 size={16} className="mt-0.5 shrink-0 text-green-600" />{t}</li>)}
+          </ul>
+          <p className="mt-4 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">Need a change to your username, role{coach ? ', team' : ''} or password? Contact your administrator.</p>
+        </Card>
+      </div>
+
+      {/* Activity summary */}
+      <Card className="mt-4">
+        <h2 className="font-semibold">{coach ? 'Your team at a glance' : 'Your review work at a glance'}</h2>
+        <div className="mt-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
+          {stats.map(([l, v, t]) => <Stat key={l} label={l} value={ev.isLoading ? '…' : v} tone={t} />)}
+        </div>
       </Card>
     </>
   )

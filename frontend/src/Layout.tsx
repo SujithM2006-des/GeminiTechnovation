@@ -5,7 +5,6 @@ import { useAuth, home } from './auth'
 import type { Role } from './types'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAlertReads, useEvents } from './queries'
-import { usePrefs } from './prefs'
 import { markAlertsRead } from './api/services'
 import { Badge, RiskBadge } from './ui'
 
@@ -39,11 +38,10 @@ export default function Layout() {
   const [menu, setMenu] = useState(false)
   const [q, setQ] = useState('')
   const events = useEvents()
-  // Medical staff and coaches: the bell shows their unread alerts (Settings > Notifications picks the levels).
+  // Medical staff and coaches: the bell shows their unread alerts (every risk level).
   // Admin: unchanged, every high-risk event.
   const staff = !!user && user.role !== 'ADMIN' && !user.dev
   const reads = useAlertReads(staff)
-  const prefs = usePrefs(user?.name)
   const qc = useQueryClient()
   if (!user) return <Navigate to="/login" replace />
 
@@ -51,7 +49,7 @@ export default function Layout() {
   const RISKS = ['HIGH', 'MEDIUM', 'LOW']
   const readIds = new Set(reads.data ?? [])
   const high = staff
-    ? (events.data ?? []).filter((e) => prefs.alertRisks.includes(e.risk ?? 'LOW') && !readIds.has(e.id))
+    ? (events.data ?? []).filter((e) => !readIds.has(e.id))
       .sort((a, b) => RISKS.indexOf(a.risk ?? 'LOW') - RISKS.indexOf(b.risk ?? 'LOW') || +new Date(b.timestamp) - +new Date(a.timestamp))
     : (events.data ?? []).filter((e) => e.risk === 'HIGH')
   const markRead = (ids: number[]) => {
@@ -61,17 +59,39 @@ export default function Layout() {
   }
   const search = (e: FormEvent) => { e.preventDefault(); nav(`/events?q=${encodeURIComponent(q)}`) }
 
-  const side = (mobile: boolean) => (
-    <nav aria-label="Main" className="flex h-full flex-col bg-[#0b1f3a] text-slate-200">
-      <div className="flex h-16 items-center gap-2 px-4 text-white"><Shield className="shrink-0 text-sky-400" size={26} />{(mobile || !collapsed) && <div><p className="font-bold leading-tight">AthleteGuard</p><p className="text-[10px] text-slate-400">Injury Detection</p></div>}</div>
-      <ul className="flex-1 space-y-1 overflow-y-auto px-2 py-2">
-        {items.map((i) => (
-          <li key={i.to}><NavLink to={i.to} onClick={() => setDrawer(false)} title={i.label} className={({ isActive }) => `flex items-center gap-3 rounded-lg px-3 py-2 text-sm ${isActive ? 'bg-sky-500/20 text-white' : 'hover:bg-white/10'}`}><i.icon size={18} className="shrink-0" />{(mobile || !collapsed) && i.label}</NavLink></li>
-        ))}
-      </ul>
-      <NavLink to="/help" onClick={() => setDrawer(false)} className="m-2 flex items-center gap-3 rounded-lg px-3 py-2 text-sm hover:bg-white/10"><HelpCircle size={18} className="shrink-0" />{(mobile || !collapsed) && 'Help'}</NavLink>
-    </nav>
-  )
+  const ROLE_NAME: Record<Role, string> = { ADMIN: 'Administrator', MEDICAL: 'Medical staff', COACH: 'Coach' }
+  const side = (mobile: boolean) => {
+    const wide = mobile || !collapsed
+    const link = (isActive: boolean) => `group relative flex items-center gap-3 rounded-xl ${wide ? 'px-4' : 'justify-center px-0'} py-3 text-[15px] font-medium transition ${isActive ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-white/10 hover:text-white'}`
+    return (
+      <nav aria-label="Main" className="flex h-full flex-col bg-[#0b1f3a] text-slate-200">
+        <div className={`flex h-16 shrink-0 items-center gap-2 border-b border-white/10 text-white ${wide ? 'px-5' : 'justify-center'}`}><Shield className="shrink-0 text-sky-400" size={26} />{wide && <div><p className="font-bold leading-tight">AthleteGuard</p><p className="text-[10px] text-slate-400">Injury Detection</p></div>}</div>
+        {wide && <p className="px-6 pb-2 pt-6 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Menu</p>}
+        <ul className={`flex-1 space-y-2 overflow-y-auto px-3 ${wide ? 'pb-4' : 'py-6'}`}>
+          {items.map((i) => (
+            <li key={i.to}>
+              <NavLink to={i.to} onClick={() => setDrawer(false)} title={i.label} className={({ isActive }) => link(isActive)}>
+                {({ isActive }) => <>
+                  {isActive && <span className="absolute inset-y-2 left-0 w-1 rounded-r bg-sky-400" />}
+                  <i.icon size={20} className="shrink-0" />{wide && i.label}
+                </>}
+              </NavLink>
+            </li>
+          ))}
+        </ul>
+        <div className="shrink-0 space-y-2 border-t border-white/10 px-3 py-4">
+          {wide && (
+            <div className="flex items-center gap-3 rounded-xl bg-white/5 px-3 py-3">
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-sky-500 text-sm font-bold text-white">{(user.name[0] || '?').toUpperCase()}</span>
+              <div className="min-w-0"><p className="truncate text-sm font-semibold text-white">{user.name}</p><p className="truncate text-xs text-slate-400">{ROLE_NAME[user.role]}</p></div>
+            </div>
+          )}
+          <NavLink to="/help" onClick={() => setDrawer(false)} title="Help" className={({ isActive }) => link(isActive)}><HelpCircle size={20} className="shrink-0" />{wide && 'Help'}</NavLink>
+          <button title="Log out" onClick={() => { logout(); nav('/login', { replace: true }) }} className={link(false) + ' w-full hover:!bg-red-500/15 hover:!text-red-200'}><LogOut size={20} className="shrink-0" />{wide && 'Log out'}</button>
+        </div>
+      </nav>
+    )
+  }
 
   return (
     <div className="flex min-h-screen">
