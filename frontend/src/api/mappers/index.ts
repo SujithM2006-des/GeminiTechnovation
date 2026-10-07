@@ -5,7 +5,10 @@ import { API_BASE } from '../client'
 /** A null player_id always maps to UNKNOWN; identity is never guessed. */
 export const unknownPlayer: PlayerRef = { trackId: null, playerId: null, name: null, jersey: null, team: null, identityStatus: 'UNKNOWN', identityConfidence: null }
 
-export const toRole = (r: string): Role => (r.toUpperCase() === 'ADMIN' ? 'ADMIN' : r.toUpperCase() === 'MEDICAL' ? 'MEDICAL' : 'COACH')
+export const toRole = (r: string): Role => {
+  const v = r.toUpperCase()
+  return v === 'ADMIN' ? 'ADMIN' : v === 'MEDICAL' ? 'MEDICAL' : v === 'PLAYER' ? 'PLAYER' : 'COACH'
+}
 
 const toRisk = (r: string | null): RiskLevel | null => {
   const v = (r || '').toUpperCase()
@@ -57,6 +60,15 @@ export function toEvent(e: EventDto): InjuryEvent {
       team: e.gemini_team,
       jerseyConfidence: e.gemini_jersey_confidence,
     },
+    aiInjury: e.ai_injury && e.ai_injury.injuries?.length ? {
+      description: e.ai_injury.description ?? null,
+      action: e.ai_injury.action ?? null,
+      side: e.ai_injury.side ?? null,
+      rest: e.ai_injury.rest ?? e.ai_injury.injuries[0].rest ?? null,
+      risk: e.ai_injury.risk ?? null,
+      injuries: e.ai_injury.injuries.map((i) => ({ injury: i.injury, bodyArea: i.body_area, risk: i.risk ?? null, safetyMeasure: i.safety_measure ?? null, rest: i.rest ?? null, likelihood: i.likelihood ?? null })),
+      checkedAt: e.ai_injury.checked_at ?? null,
+    } : null,
   }
 }
 
@@ -81,6 +93,11 @@ export interface AppUser {
   role: Role
   teamId: number | null
   teamName: string | null
+  /** Player logins: the roster player this account belongs to */
+  playerId: number | null
+  playerName: string | null
+  jersey: number | null
+  coaches: string[]
 }
 
-export const toUser = (u: UserDto): AppUser => ({ id: u.id, username: u.username, role: toRole(u.role), teamId: u.team_id, teamName: u.team_name })
+export const toUser = (u: UserDto): AppUser => ({ id: u.id, username: u.username, role: toRole(u.role), teamId: u.team_id, teamName: u.team_name, playerId: u.player_id ?? null, playerName: u.player_name ?? null, jersey: u.jersey_number ?? null, coaches: u.coaches ?? [] })

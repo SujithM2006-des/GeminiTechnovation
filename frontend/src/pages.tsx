@@ -17,7 +17,7 @@ import { safetyMeasures, SAFETY_DISCLAIMER } from './safety'
 import { Badge, Card, Confirm, Disclaimer, EmptyState, ErrorState, Field, IdentityBadge, Modal, Na, PageHeader, RiskBadge, SafetyMeasures, Skeleton, btn, btnD, btnP, btnS, inp, inpAuto, useToast, type Tone } from './ui'
 
 /** Small outlined button used instead of text links */
-const btnSm = `${btnS} !gap-1.5 !px-2.5 !py-1 !text-xs`
+export const btnSm = `${btnS} !gap-1.5 !px-2.5 !py-1 !text-xs`
 
 /** Shown when a button needs something the backend doesn't have yet. */
 const NC = "Not available yet: the backend doesn't support this. Nothing was saved."
@@ -35,7 +35,7 @@ const METHOD_LABELS: Record<string, string> = {
 }
 
 /** e.g. "Face · 91%" */
-const identText = (e: InjuryEvent) => {
+export const identText = (e: InjuryEvent) => {
   if (!e.identified || !e.identifiedBy) return null
   let t = METHOD_LABELS[e.identifiedBy] ?? e.identifiedBy
   if (e.player.identityConfidence !== null) t += ` · ${Math.round(e.player.identityConfidence * 100)}%`
@@ -43,17 +43,18 @@ const identText = (e: InjuryEvent) => {
 }
 
 /** Seconds into the video -> "0:12:05" */
-const fmtVideo = (s: number | null) => {
+export const fmtVideo = (s: number | null) => {
   if (s === null || s === undefined) return null
   const x = Math.floor(s)
   return `${Math.floor(x / 3600)}:${String(Math.floor((x % 3600) / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`
 }
-const fmtDate = (v: string | null) => (v ? new Date(v).toLocaleString(undefined, dateOptions()) : '—')
+export const fmtDate = (v: string | null) => (v ? new Date(v).toLocaleString(undefined, dateOptions()) : '—')
 const fileName = (p: string | null) => (p ? p.split(/[\\/]/).pop() ?? p : '—')
 
 const geminiBadge = (e: InjuryEvent): { text: string; tone: Tone } | null => {
   const v = e.gemini.verdict
-  if (!v) return null
+  // the injury check's yes/no decision is not shown: only its possible injuries and rest
+  if (!v || e.aiInjury || v === 'jersey_only') return null
   const pct = e.gemini.confidence !== null ? ` · ${Math.round(e.gemini.confidence * 100)}%` : ''
   if (v === 'real_fall') return { text: `Gemini: real fall${pct}`, tone: 'green' }
   if (v === 'false_alarm') return { text: `Gemini: false alarm?${pct}`, tone: 'red' }
@@ -65,6 +66,51 @@ const geminiBadge = (e: InjuryEvent): { text: string; tone: Tone } | null => {
 const geminiDisagrees = (e: InjuryEvent) => {
   if (e.gemini.jersey === null || e.identifiedBy === 'gemini') return false
   return !e.identified || e.gemini.jersey !== e.player.jersey
+}
+
+/** Gemini's possible injuries as one line, e.g. "Hamstring strain, Calf strain · rest 1-8+ weeks".
+ *  Falls back to the detector's own note when Gemini has not reviewed the clip (yet). */
+export const injuryText = (e: InjuryEvent) =>
+  e.aiInjury ? `${e.aiInjury.injuries.map((i) => i.injury).join(', ')}${e.aiInjury.rest ? ` · rest ${e.aiInjury.rest}` : ''}` : (e.injuryNote ?? e.note ?? null)
+
+/** Catalog risk (Low ... Critical) -> badge colour */
+const CATALOG_RISK_TONE: Record<string, Tone> = { Low: 'green', 'Low-Medium': 'green', Medium: 'amber', 'Medium-High': 'orange', High: 'red', Critical: 'red' }
+
+/** Possible injuries from Gemini's review of the clip, with risk, first step and rest time (values from the injury catalog). */
+export function PossibleInjuries({ e, compact = false }: { e: InjuryEvent; compact?: boolean }) {
+  const a = e.aiInjury
+  if (!a) {
+    return (
+      <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+        <p className="text-xs font-semibold uppercase tracking-wide">Possible injury</p>
+        <p>{e.injuryNote ?? e.note ?? 'No injury note'}</p>
+      </div>
+    )
+  }
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="text-xs font-semibold uppercase tracking-wide text-amber-900">Possible injuries</p>
+        {a.rest && <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-amber-200"><CalendarDays size={12} />Expected rest {a.rest}</span>}
+      </div>
+      {a.description && <p className="mt-1 text-xs text-amber-900">{a.description}</p>}
+      <ul className="mt-2 space-y-1.5">
+        {a.injuries.map((i, k) => (
+          <li key={i.injury} className="rounded-lg bg-white/80 px-2.5 py-2">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="font-semibold">{i.injury}</span>
+              <span className="text-xs text-slate-500">{i.bodyArea}</span>
+              {k === 0 && a.injuries.length > 1 && <Badge tone="blue">Most likely</Badge>}
+              {i.risk && <Badge tone={CATALOG_RISK_TONE[i.risk] ?? 'gray'}>{i.risk}</Badge>}
+              <span className="ml-auto text-xs font-semibold text-slate-700">Rest {i.rest ?? '—'}</span>
+            </div>
+            {!compact && i.safetyMeasure && <p className="mt-0.5 text-xs text-slate-600">First step: {i.safetyMeasure}</p>}
+          </li>
+        ))}
+      </ul>
+      <p className="mt-2 text-[11px] text-amber-800">AI estimate from the clip, not a medical diagnosis. Return to play is a medical decision.</p>
+    </div>
+  )
 }
 
 const canChangeAny = (r: Role) => r === 'MEDICAL' || r === 'ADMIN'
@@ -173,10 +219,7 @@ function PlayerHistory({ playerId, name }: { playerId: number; name: string }) {
                 <span className="text-sm font-semibold text-slate-600">{e.region ?? 'Body area not recorded'}</span>
                 <span className="ml-auto"><Badge tone={e.resolved ? 'green' : 'gray'}>{e.resolved ? 'Resolved' : 'Pending'}</Badge></span>
               </div>
-              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-                <p className="text-xs font-semibold uppercase tracking-wide">Possible injury</p>
-                <p>{e.injuryNote ?? e.note ?? 'No injury note'}</p>
-              </div>
+              <PossibleInjuries e={e} compact />
               <SafetyMeasures eventType={e.eventType} region={e.region} risk={e.risk} />
               <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
                 <dt className="text-slate-500">Match</dt><dd className="truncate" title={e.matchName ?? ''}>{e.matchName ?? 'No match'}</dd>
@@ -314,7 +357,7 @@ function InjuryRecordList({ records, players, emptyText }: { records: InjuryHist
 }
 
 /** "Previous injury history" block shown above the detected falls in every player dropdown / player page. */
-function PreviousInjuries({ playerId, name }: { playerId: number; name: string }) {
+export function PreviousInjuries({ playerId, name }: { playerId: number; name: string }) {
   const { user } = useAuth()
   const players = usePlayers().data ?? []
   const player = players.find((p) => p.id === playerId)
@@ -523,7 +566,7 @@ export function Login() {
 }
 
 /* ---------- DASHBOARDS ---------- */
-function EventLine({ e, to }: { e: InjuryEvent; to?: string }) {
+export function EventLine({ e, to }: { e: InjuryEvent; to?: string }) {
   const g = geminiBadge(e)
   return (
     <li>
@@ -531,7 +574,8 @@ function EventLine({ e, to }: { e: InjuryEvent; to?: string }) {
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">{e.player.name ? `${e.player.name} #${e.player.jersey ?? '?'}` : 'Unidentified player'}<span className="ml-2 text-slate-400">{e.eventType}</span></p>
           <p className="truncate text-xs text-slate-500">{e.region ?? '—'} · {e.matchName ?? 'No match'}{fmtVideo(e.videoTimeSec) && ` · ${fmtVideo(e.videoTimeSec)} in video`}</p>
-          {e.gemini.description && <p className="truncate text-xs text-slate-600" title={e.gemini.reason ?? ''}><Sparkles size={11} className="mr-1 inline text-emerald-600" />{e.gemini.description}</p>}
+          {e.aiInjury ? <p className="truncate text-xs text-slate-600" title={e.aiInjury.description ?? ''}><Sparkles size={11} className="mr-1 inline text-emerald-600" />{injuryText(e)}</p>
+            : e.gemini.description && <p className="truncate text-xs text-slate-600" title={e.gemini.reason ?? ''}><Sparkles size={11} className="mr-1 inline text-emerald-600" />{e.gemini.description}</p>}
         </div>
         {g && <span className="hidden sm:inline-flex" title={e.gemini.reason ?? ''}><Badge tone={g.tone}>{g.text}</Badge></span>}
         <RiskBadge level={e.risk} />
@@ -545,6 +589,7 @@ const QA: Record<Role, [string, string][]> = {
   ADMIN: [['Add team', '/teams'], ['Register player', '/teams'], ['System status', '/admin/system']],
   COACH: [['My team', '/teams'], ['View matches', '/matches'], ['View alerts', '/alerts']],
   MEDICAL: [['Review queue', '/events'], ['Collisions', '/collisions'], ['Reports', '/reports']],
+  PLAYER: [],
 }
 /** KPI cards fill the full width whatever their count (Tailwind needs the full class names written out) */
 const KPI_COLS: Record<number, string> = { 4: 'lg:grid-cols-4', 5: 'lg:grid-cols-5', 6: 'lg:grid-cols-3 xl:grid-cols-6' }
@@ -572,6 +617,7 @@ export function Dashboard({ role }: { role: Role }) {
     ADMIN: [['Total teams', teams.data?.length ?? null], ['Total players', players.data?.length ?? null], ['Total incidents', ev.data ? list.length : null], ['High-risk incidents', ev.data ? list.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Pending medical reviews', ev.data ? open.length : null, 'text-amber-600']],
     COACH: [['Players in my team', myTeam?.playerCount ?? null], ['Recent incidents', myTeam?.injuryEvents ?? null], ['High-risk alerts', myTeam?.highRiskEvents ?? null, 'text-red-700'], ['Players needing attention', myTeam ? myTeam.players.filter((p) => p.highRiskEvents > 0).length : null, 'text-amber-600']],
     MEDICAL: [['Pending reviews', ev.data ? open.length : null], ['High priority', ev.data ? open.filter((e) => e.risk === 'HIGH').length : null, 'text-red-700'], ['Medium priority', ev.data ? open.filter((e) => e.risk === 'MEDIUM').length : null, 'text-amber-600'], ['Low priority', ev.data ? open.filter((e) => e.risk === 'LOW').length : null, 'text-green-700'], ['Assessments saved', assessments.data ? assessments.data.length : null]],
+    PLAYER: [],
   }
 
   const clearAll = async () => {
@@ -659,7 +705,6 @@ export function Dashboard({ role }: { role: Role }) {
     </>
   )
 }
-
 /* ---------- GENERIC LIST (same layout for every list page) ---------- */
 interface Cfg { title: string; crumb: string; filters: { name: string; opts: string[] }[]; create?: { label: string; fields: { n: string; l: string; opts?: string[] }[] } }
 const CFG: Record<string, Cfg> = {
@@ -748,7 +793,9 @@ function ListPageInner({ k }: { k: string }) {
 const RISK_ORDER = ['HIGH', 'MEDIUM', 'LOW']
 const byRiskThenNewest = (a: InjuryEvent, b: InjuryEvent) => RISK_ORDER.indexOf(a.risk ?? 'LOW') - RISK_ORDER.indexOf(b.risk ?? 'LOW') || +new Date(b.timestamp) - +new Date(a.timestamp)
 /** Possible-injury text without the repeated "(AI estimate only…)" tail (the report states it once) */
-const noteText = (e: InjuryEvent) => (e.injuryNote ?? e.note ?? '').replace(/\s*\(AI estimate only[^)]*\)\s*$/i, '').trim() || 'No injury note'
+const noteText = (e: InjuryEvent) => e.aiInjury
+  ? e.aiInjury.injuries.map((i) => `${i.injury} (${i.bodyArea}, ${i.risk ?? '-'} risk) - rest ${i.rest ?? '-'}`).join('\n')
+  : (e.injuryNote ?? e.note ?? '').replace(/\s*\(AI estimate only[^)]*\)\s*$/i, '').trim() || 'No injury note'
 const playerText = (e: InjuryEvent) => (e.player.name ? `${e.player.name}${e.player.jersey !== null ? ` #${e.player.jersey}` : ''}` : 'Unidentified player')
 /** The PDF's built-in font only knows basic Latin characters */
 const pdfText = (s: string) => s.replace(/[—–]/g, '-').replace(/·/g, '-').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/…/g, '...').replace(/[^\x20-\x7E\n]/g, '')
@@ -850,7 +897,7 @@ async function downloadReportPdf(list: InjuryEvent[], info: { by: string; filter
   doc.save(`AthleteGuard-injury-report-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}.pdf`)
 }
 
-function ReportsPage() {
+export function ReportsPage() {
   const { user } = useAuth()
   const toast = useToast()
   const ev = useEvents()
@@ -887,7 +934,7 @@ function ReportsPage() {
 
   return (
     <>
-      <PageHeader title="Reports" crumbs={[{ label: 'Reports' }]} actions={
+      <PageHeader title={user?.role === 'PLAYER' ? 'My injury report' : 'Reports'} crumbs={[{ label: user?.role === 'PLAYER' ? 'My report' : 'Reports' }]} actions={
         <button className={btnP} disabled={busy || ev.isLoading || rows.length === 0} onClick={download} title={rows.length === 0 ? 'No injury events to put in the report' : 'Download this report as a PDF'}>
           <Download size={16} />{busy ? 'Preparing PDF…' : 'Download report'}
         </button>} />
@@ -895,8 +942,13 @@ function ReportsPage() {
       <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
         <Mini l="Events in report" v={ev.isLoading ? '…' : rows.length} />
         <Mini l="High risk" v={ev.isLoading ? '…' : rows.filter((e) => e.risk === 'HIGH').length} t="text-red-700" />
-        <Mini l="Players affected" v={ev.isLoading ? '…' : players} />
-        <Mini l="Unidentified falls" v={ev.isLoading ? '…' : rows.filter((e) => !e.identified).length} t="text-amber-600" />
+        {user?.role === 'PLAYER' ? <>
+          <Mini l="Waiting for medical review" v={ev.isLoading ? '…' : rows.filter((e) => !e.resolved).length} t="text-amber-600" />
+          <Mini l="Reviewed" v={ev.isLoading ? '…' : rows.filter((e) => e.resolved).length} t="text-green-700" />
+        </> : <>
+          <Mini l="Players affected" v={ev.isLoading ? '…' : players} />
+          <Mini l="Unidentified falls" v={ev.isLoading ? '…' : rows.filter((e) => !e.identified).length} t="text-amber-600" />
+        </>}
       </div>
 
       <Card className="!p-0">
@@ -917,7 +969,7 @@ function ReportsPage() {
                   <td className="min-w-40 px-4 py-3"><p className="font-semibold">{playerText(e)}</p>{e.player.team && <p className="text-xs text-slate-500">{e.player.team}</p>}{!e.identified && <div className="mt-1"><Badge tone="amber">Unidentified</Badge></div>}</td>
                   <td className="px-4 py-3"><p className="font-medium">{e.eventType}</p><p className="text-xs text-slate-500">{e.region ?? 'Body area not recorded'}</p><Link to={`/events/${e.id}`} className={btnSm + ' mt-2'}><ExternalLink size={14} />Open #{e.id}</Link></td>
                   <td className="px-4 py-3"><RiskBadge level={e.risk} /></td>
-                  <td className="max-w-64 px-4 py-3 text-slate-700">{noteText(e)}</td>
+                  <td className="max-w-72 px-4 py-3 text-slate-700">{e.aiInjury ? <><ul className="space-y-1">{e.aiInjury.injuries.map((i) => <li key={i.injury}><span className="font-medium">{i.injury}</span> <span className="text-xs text-slate-500">({i.bodyArea}{i.risk ? `, ${i.risk}` : ''})</span> <span className="text-xs text-slate-600">· rest {i.rest ?? '—'}</span></li>)}</ul>{e.aiInjury.rest && <p className="mt-1.5"><Badge tone="amber">Expected rest {e.aiInjury.rest}</Badge></p>}</> : noteText(e)}</td>
                   <td className="min-w-64 px-4 py-3"><ul className="list-disc space-y-0.5 pl-4 text-xs text-slate-700">{safetyMeasures(e.eventType, e.region, e.risk).map((m) => <li key={m}>{m}</li>)}</ul></td>
                   <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-600"><p className="font-medium text-slate-700">{e.matchName ?? 'No match'}</p>{fmtVideo(e.videoTimeSec) && <p>at {fmtVideo(e.videoTimeSec)} in video</p>}<p className="text-slate-400">{fmtDate(e.timestamp)}</p></td>
                 </tr>
@@ -935,31 +987,39 @@ function ReportsPage() {
 }
 
 /* ---------- USERS (admin): logins with a username, a starting password and a role ---------- */
-const ROLE_LABEL: Record<Role, string> = { ADMIN: 'Admin', MEDICAL: 'Medical staff', COACH: 'Coach' }
-const ROLE_TONE: Record<Role, Tone> = { ADMIN: 'blue', MEDICAL: 'green', COACH: 'amber' }
+export const ROLE_LABEL: Record<Role, string> = { ADMIN: 'Admin', MEDICAL: 'Medical staff', COACH: 'Coach', PLAYER: 'Player' }
+export const ROLE_TONE: Record<Role, Tone> = { ADMIN: 'blue', MEDICAL: 'green', COACH: 'amber', PLAYER: 'violet' }
+const ROLES: Role[] = ['ADMIN', 'MEDICAL', 'COACH', 'PLAYER']
 
 const us = z.object({
   username: z.string().trim().min(1, 'Username is required').max(50, 'Username must be 50 characters or fewer').regex(/^\S+$/, 'Username cannot contain spaces'),
   password: z.string().min(6, 'Password must be at least 6 characters').max(72, 'Password must be 72 characters or fewer'),
   role: z.string().min(1, 'Pick a role'),
   teamId: z.string(),
+  playerId: z.string(),
 }).refine((v) => v.role !== 'COACH' || v.teamId !== '', { path: ['teamId'], message: 'Pick the team this coach manages' })
+  .refine((v) => v.role !== 'PLAYER' || v.playerId !== '', { path: ['playerId'], message: 'Pick the player this login belongs to' })
 
 function CreateUserModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useToast()
   const qc = useQueryClient()
   const teams = useTeams().data ?? []
+  const allPlayers = usePlayers().data ?? []
+  const users = useQuery({ queryKey: ['users'], queryFn: getUsers, enabled: open }).data ?? []
+  const withLogin = new Set(users.map((u) => u.playerId).filter((x) => x !== null))
+  const freePlayers = allPlayers.filter((p) => !withLogin.has(p.id))
   const [show, setShow] = useState(false)
   const [err, setErr] = useState('')
-  const empty = { username: '', password: '', role: '', teamId: '' }
+  const empty = { username: '', password: '', role: '', teamId: '', playerId: '' }
   const f = useForm<z.infer<typeof us>>({ resolver: zodResolver(us), defaultValues: empty })
   const role = f.watch('role')
+  const playerId = f.watch('playerId')
   const close = () => { f.reset(empty); setErr(''); setShow(false); onClose() }
   const submit = f.handleSubmit(async (v) => {
     setErr('')
     try {
-      const u = await createUser({ username: v.username.trim(), password: v.password, role: v.role as Role, teamId: v.teamId ? Number(v.teamId) : null })
-      toast(`Created ${u.username} (${ROLE_LABEL[u.role]}). They can log in now.`)
+      const u = await createUser({ username: v.username.trim(), password: v.password, role: v.role as Role, teamId: v.teamId ? Number(v.teamId) : null, playerId: v.playerId ? Number(v.playerId) : null })
+      toast(u.role === 'PLAYER' ? `Created ${u.username}: ${u.playerName ?? 'player'}'s dashboard login. They can log in now.` : `Created ${u.username} (${ROLE_LABEL[u.role]}). They can log in now.`)
       qc.invalidateQueries({ queryKey: ['users'] })
       qc.invalidateQueries({ queryKey: ['teams'] })
       close()
@@ -975,11 +1035,17 @@ function CreateUserModal({ open, onClose }: { open: boolean; onClose: () => void
           <div className="relative"><input className={inp} type={show ? 'text' : 'password'} autoComplete="new-password" placeholder="At least 6 characters" {...f.register('password')} /><button type="button" aria-label={show ? 'Hide password' : 'Show password'} className="absolute right-3 top-2.5 text-slate-500" onClick={() => setShow((s) => !s)}>{show ? <EyeOff size={16} /> : <Eye size={16} />}</button></div>
         </Field>
         <Field label="Role *" err={f.formState.errors.role?.message}>
-          <select className={inp} {...f.register('role')}><option value="">Select…</option>{(['ADMIN', 'MEDICAL', 'COACH'] as Role[]).map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}</select>
+          <select className={inp} {...f.register('role')}><option value="">Select…</option>{ROLES.map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}</select>
         </Field>
         {role === 'COACH' && (
           <Field label="Team *" err={f.formState.errors.teamId?.message}>
             <select className={inp} {...f.register('teamId')}><option value="">Select team…</option>{teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+          </Field>
+        )}
+        {role === 'PLAYER' && (
+          <Field label="Player *" err={f.formState.errors.playerId?.message}>
+            <PlayerSelect players={freePlayers} value={playerId} onChange={(v) => f.setValue('playerId', v, { shouldValidate: true })} />
+            <p className="mt-1 text-xs text-slate-500">The player sees only their own profile, injury history, injury events and report. Players who already have a login are not listed.</p>
           </Field>
         )}
         <p className="text-xs text-slate-500">Share the username and password with the person. They log in with them right away.</p>
@@ -1027,18 +1093,18 @@ function UsersPage() {
       <Card className="!p-0">
         <div className="flex flex-wrap gap-2 border-b border-slate-200 p-3">
           <input aria-label="Search users" className={inp + ' max-w-xs'} placeholder="Search username or team…" value={search} onChange={(e) => setSearch(e.target.value)} />
-          <select aria-label="Role" className={inpAuto} value={roleF} onChange={(e) => setRoleF(e.target.value)}><option value="">Role: All</option>{(['ADMIN', 'MEDICAL', 'COACH'] as Role[]).map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}</select>
+          <select aria-label="Role" className={inpAuto} value={roleF} onChange={(e) => setRoleF(e.target.value)}><option value="">Role: All</option>{ROLES.map((r) => <option key={r} value={r}>{ROLE_LABEL[r]}</option>)}</select>
           {(search || roleF) && <button className={btnS} onClick={() => { setSearch(''); setRoleF('') }}>Clear</button>}
         </div>
         <div className="overflow-x-auto"><table className="w-full text-left text-sm">
-          <thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{['Username', 'Role', 'Team', 'Actions'].map((h) => <th key={h} className={th + (h === 'Actions' ? ' text-right' : '')}>{h}</th>)}</tr></thead>
+          <thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{['Username', 'Role', 'Team / player', 'Actions'].map((h) => <th key={h} className={th + (h === 'Actions' ? ' text-right' : '')}>{h}</th>)}</tr></thead>
           <tbody>
             {q.isLoading && [0, 1, 2].map((i) => <tr key={i}><td colSpan={4} className="px-4 py-3"><Skeleton /></td></tr>)}
             {rows.map((u) => (
               <tr key={u.id} className="border-t hover:bg-slate-50">
                 <td className="px-4 py-3"><span className="font-medium">{u.username}</span>{isMe(u) && <span className="ml-2"><Badge tone="gray">You</Badge></span>}</td>
                 <td className="px-4 py-3"><Badge tone={ROLE_TONE[u.role]}>{ROLE_LABEL[u.role]}</Badge></td>
-                <td className="px-4 py-3 text-slate-600">{u.role === 'COACH' ? (u.teamName ?? '—') : <span className="text-slate-400">All teams</span>}</td>
+                <td className="px-4 py-3 text-slate-600">{u.role === 'PLAYER' ? <>{u.playerName ?? '—'}{u.jersey !== null && ` #${u.jersey}`}{u.teamName && <span className="text-slate-400"> · {u.teamName}</span>}</> : u.role === 'COACH' ? (u.teamName ?? '—') : <span className="text-slate-400">All teams</span>}</td>
                 <td className="px-4 py-3 text-right">{!isMe(u) && <button className={btnSm + ' !text-red-700'} onClick={() => setDel(u)}><Trash2 size={14} />Delete</button>}</td>
               </tr>
             ))}
@@ -1173,7 +1239,6 @@ function StaticList({ k, onCreate }: { k: string; onCreate?: () => void }) {
     </>
   )
 }
-
 function TeamsTable({ q }: { q: string }) {
   const t = useTeams()
   const rows = (t.data ?? []).filter((x) => !q || `${x.name} ${x.coaches.join(' ')}`.toLowerCase().includes(q.toLowerCase()))
@@ -1307,7 +1372,7 @@ function EventsList({ collisions, q, risk, type, match, identity, filtered }: { 
                   <td className="min-w-56 max-w-80 px-4 py-3">
                     <div className="flex items-center gap-2"><span className="font-semibold">{e.eventType} #{e.id}</span><Link className={btnSm} to={`${base}/${e.id}`}><ExternalLink size={14} />Open</Link></div>
                     <p className="text-xs text-slate-500">{e.region ?? 'Body area not recorded'}{e.source === 'manual' ? ' · logged by staff' : ''}</p>
-                    {(e.injuryNote || e.note) && <p className="mt-1 text-xs text-slate-600">{e.injuryNote ?? e.note}</p>}
+                    {injuryText(e) && <p className="mt-1 text-xs text-slate-600">{injuryText(e)}</p>}
                     {g && <div className="mt-1"><Badge tone={g.tone}>{g.text}</Badge></div>}
                     {geminiDisagrees(e) && <p className="mt-1 text-xs text-amber-700">Gemini read #{e.gemini.jersey}{e.gemini.team && e.gemini.team !== 'unknown' ? ` (${e.gemini.team})` : ''}</p>}
                   </td>
@@ -1501,7 +1566,8 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
   const fromList = (ev.data ?? []).find((e) => String(e.id) === id)
   // After a coach names a player from the other team, the event leaves their list: keep showing what was saved.
   const e = fromList ?? (saved && String(saved.id) === id ? saved : null)
-  const crumbs = [{ label: collision ? 'Collisions' : 'Events', to: collision ? '/collisions' : '/events' }, { label: `#${id}` }]
+  const isPlayer = user?.role === 'PLAYER'
+  const crumbs = [{ label: collision ? 'Collisions' : isPlayer ? 'My injury events' : 'Events', to: collision ? '/collisions' : isPlayer ? '/player/events' : '/events' }, { label: `#${id}` }]
   const title = `${collision ? 'Collision' : 'Incident'} #${id}`
   const staff = !!user && user.role !== 'ADMIN' && !user.dev
   const assessment = useQuery({ queryKey: ['assessment', id], queryFn: () => getAssessment(Number(id)), enabled: staff && !!fromList })
@@ -1533,7 +1599,7 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
             <dt className="text-slate-500">Identity confidence</dt><dd><Na v={e.player.identityConfidence !== null ? `${Math.round(e.player.identityConfidence * 100)}%` : null} /></dd>
           </dl>
           {e.idDetail && <p className="mt-2 rounded-lg bg-slate-50 p-2 text-xs text-slate-600">{e.idDetail}</p>}
-          {e.player.playerId !== null && <Link to={`/players/${e.player.playerId}`} className={btnS + ' mt-3'}><History size={16} />Player history</Link>}
+          {e.player.playerId !== null && !isPlayer && <Link to={`/players/${e.player.playerId}`} className={btnS + ' mt-3'}><History size={16} />Player history</Link>}
         </Card>
         {collision && <Card><p className="text-xs font-semibold uppercase text-slate-500">Player B</p><p className="mt-2 font-semibold">Second participant not reported</p></Card>}
         <Card>
@@ -1573,7 +1639,8 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
         {user && canAssign(user.role, e) && <div className="md:col-span-2 xl:col-span-3"><IdentifyPanel key={`${e.id}-${e.player.playerId}`} ev={e} onSaved={(u) => { if (u) setSaved(u) }} /></div>}
         <Card className="md:col-span-2 xl:col-span-3">
           <h2 className="font-semibold">AI-suggested screening categories</h2>
-          {e.injuryNote || e.note ? <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"><b>Possible injury:</b> {e.injuryNote ?? e.note}</div>
+          {e.aiInjury ? <div className="mt-2"><PossibleInjuries e={e} /></div>
+            : e.injuryNote || e.note ? <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"><b>Possible injury:</b> {e.injuryNote ?? e.note}</div>
             : <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900"><b>Insufficient visual evidence.</b> No specific category is shown. Review the clip and perform medical assessment if concerning.</div>}
           <div className="mt-3"><SafetyMeasures eventType={e.eventType} region={e.region} risk={e.risk} /></div>
           <p className="mt-2 text-sm font-semibold">AI-suggested screening categories, NOT a confirmed diagnosis.</p>
@@ -1591,7 +1658,7 @@ export function EventDetail({ collision = false }: { collision?: boolean }) {
 /* ---------- MEDICAL ASSESSMENT (Medical only; route-guarded). Saved in output/assessments.json ---------- */
 const sel = ['Yes', 'No', 'Not assessed']
 const ASSESS_STATUS = ['Under observation', 'Further evaluation', 'Imaging referred', 'Cleared', 'Referred']
-const STATUS_TONE: Record<string, Tone> = { 'Under observation': 'amber', 'Further evaluation': 'violet', 'Imaging referred': 'blue', Cleared: 'green', Referred: 'red' }
+export const STATUS_TONE: Record<string, Tone> = { 'Under observation': 'amber', 'Further evaluation': 'violet', 'Imaging referred': 'blue', Cleared: 'green', Referred: 'red' }
 const as = z.object({ pain: z.string().min(1, 'Required'), swelling: z.string().min(1, 'Required'), tenderness: z.string().min(1, 'Required'), rom: z.string().min(1, 'Required'), weight: z.string().min(1, 'Required'), neuro: z.string().min(1, 'Required'), notes: z.string().max(4000, 'Keep it under 4000 characters'), imaging: z.string(), impression: z.string().trim().min(1, 'Clinical impression is required').max(4000, 'Keep it under 4000 characters'), status: z.string().min(1, 'Final status is required') })
 type AssessForm = z.infer<typeof as>
 const EMPTY_ASSESS: AssessForm = { pain: '', swelling: '', tenderness: '', rom: '', weight: '', neuro: '', notes: '', imaging: '', impression: '', status: '' }
@@ -1635,7 +1702,7 @@ export function Assessment() {
     <>
       <PageHeader title={saved ? 'Edit medical assessment' : 'Medical assessment'} crumbs={[{ label: 'Events', to: '/events' }, { label: `#${id}`, to: `/events/${id}` }, { label: 'Assessment' }]} />
       <div className="mb-4"><Disclaimer /></div>
-      {e && <Card className="mb-4"><p className="text-sm"><b>{e.player.name ?? 'Unidentified player'}</b> · {e.eventType} · {e.region ?? '—'} · <RiskBadge level={e.risk} /></p>{(e.injuryNote || e.note) && <p className="mt-1 text-sm text-slate-600">{e.injuryNote ?? e.note}</p>}<div className="mt-3"><SafetyMeasures eventType={e.eventType} region={e.region} risk={e.risk} /></div></Card>}
+      {e && <Card className="mb-4"><p className="text-sm"><b>{e.player.name ?? 'Unidentified player'}</b> · {e.eventType} · {e.region ?? '—'} · <RiskBadge level={e.risk} /></p>{e.aiInjury ? <div className="mt-3"><PossibleInjuries e={e} /></div> : (e.injuryNote || e.note) && <p className="mt-1 text-sm text-slate-600">{e.injuryNote ?? e.note}</p>}<div className="mt-3"><SafetyMeasures eventType={e.eventType} region={e.region} risk={e.risk} /></div></Card>}
       {!e && !ev.isLoading ? (
         <Card><EmptyState title="Incident not found" text={ev.isError ? normalizeApiError(ev.error) : 'It may have been deleted (for example by Gemini as a false alarm).'} action={<Link className={btnS} to="/events">Back to events</Link>} /></Card>
       ) : (
@@ -1664,7 +1731,6 @@ export function Alerts() {
   const { user } = useAuth()
   return user && user.role !== 'ADMIN' && !user.dev ? <StaffAlerts /> : <AdminAlerts />
 }
-
 function AdminAlerts() {
   const [pri, setPri] = useState('All')
   const [read, setRead] = useState('All')
@@ -1683,7 +1749,7 @@ function AdminAlerts() {
             <li key={e.id} className={!e.resolved ? 'bg-sky-50/40' : ''}>
               <Link to={`/events/${e.id}`} className="flex items-start gap-3 px-4 py-3 hover:bg-slate-50">
                 {!e.resolved && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-500" aria-label="Unread" />}
-                <div className="min-w-0 flex-1"><p className="text-sm font-medium">{e.player.name ?? 'Unidentified player'} · {e.eventType} · {e.region ?? '—'}</p><p className="truncate text-xs text-slate-500">{e.injuryNote ?? e.note ?? ''}</p><p className="text-xs text-slate-400">{fmtDate(e.timestamp)}{e.matchName ? ` · ${e.matchName}` : ''}</p></div>
+                <div className="min-w-0 flex-1"><p className="text-sm font-medium">{e.player.name ?? 'Unidentified player'} · {e.eventType} · {e.region ?? '—'}</p><p className="truncate text-xs text-slate-500">{injuryText(e) ?? ''}</p><p className="text-xs text-slate-400">{fmtDate(e.timestamp)}{e.matchName ? ` · ${e.matchName}` : ''}</p></div>
                 <RiskBadge level={e.risk} />
               </Link>
             </li>
@@ -1802,6 +1868,7 @@ export function System() {
 
 export function Settings() {
   const { user } = useAuth()
+  if (user?.role === 'PLAYER') return <Navigate to="/player/profile" replace />
   return user && user.role !== 'ADMIN' && !user.dev ? <StaffSettings /> : <AdminSettings />
 }
 
@@ -1964,7 +2031,7 @@ function StaffAlerts() {
               <li key={e.id} className={isUnread ? 'bg-sky-50/40' : ''}>
                 <Link to={`/events/${e.id}`} onClick={() => open(e.id)} className="flex items-start gap-3 px-4 py-3 hover:bg-slate-50">
                   <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${isUnread ? 'bg-sky-500' : 'bg-transparent'}`} aria-label={isUnread ? 'Unread' : 'Read'} />
-                  <div className="min-w-0 flex-1"><p className={`text-sm ${isUnread ? 'font-semibold' : 'font-medium text-slate-700'}`}>{e.player.name ?? 'Unidentified player'} · {e.eventType} · {e.region ?? '—'}</p><p className="truncate text-xs text-slate-500">{e.injuryNote ?? e.note ?? ''}</p><p className="text-xs text-slate-400">{fmtDate(e.timestamp)}{e.matchName ? ` · ${e.matchName}` : ''}{e.resolved ? ' · reviewed by medical staff' : ''}</p></div>
+                  <div className="min-w-0 flex-1"><p className={`text-sm ${isUnread ? 'font-semibold' : 'font-medium text-slate-700'}`}>{e.player.name ?? 'Unidentified player'} · {e.eventType} · {e.region ?? '—'}</p><p className="truncate text-xs text-slate-500">{injuryText(e) ?? ''}</p><p className="text-xs text-slate-400">{fmtDate(e.timestamp)}{e.matchName ? ` · ${e.matchName}` : ''}{e.resolved ? ' · reviewed by medical staff' : ''}</p></div>
                   <RiskBadge level={e.risk} />
                 </Link>
               </li>
@@ -1976,7 +2043,7 @@ function StaffAlerts() {
 }
 
 /* ---------- settings (medical staff and coaches): a full-page profile. Only the admin can change these details. ---------- */
-const ROLE_ACCESS: Record<Role, string[]> = {
+export const ROLE_ACCESS: Record<Role, string[]> = {
   ADMIN: [],
   COACH: [
     'See your own team\'s incidents and every unidentified fall',
@@ -1991,6 +2058,12 @@ const ROLE_ACCESS: Record<Role, string[]> = {
     'Log manual events seen by staff',
     'Correct the identified player of any fall',
     'Download the injury report as PDF',
+  ],
+  PLAYER: [
+    'See your own falls with the clip, possible injuries and expected rest',
+    'See your previous injury history',
+    'See the outcome of your medical review',
+    'Download your own injury report as PDF',
   ],
 }
 

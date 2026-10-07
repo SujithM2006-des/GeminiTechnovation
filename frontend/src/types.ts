@@ -1,4 +1,4 @@
-export type Role = 'ADMIN' | 'MEDICAL' | 'COACH'
+export type Role = 'ADMIN' | 'MEDICAL' | 'COACH' | 'PLAYER'
 export type IdentityStatus = 'CONFIRMED' | 'UNCERTAIN' | 'UNKNOWN'
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH'
 
@@ -23,6 +23,27 @@ export interface GeminiInfo {
   jerseyConfidence: number | null
 }
 
+/** One possible injury picked by Gemini from the injury catalog (risk, first step and rest come from the catalog). */
+export interface PossibleInjury {
+  injury: string
+  bodyArea: string
+  risk: string | null
+  safetyMeasure: string | null
+  rest: string | null
+  likelihood: number | null
+}
+
+/** Gemini's review of the clip: what happened, possible injuries and the expected rest. */
+export interface AiInjury {
+  description: string | null
+  action: string | null
+  side: string | null
+  rest: string | null
+  risk: string | null
+  injuries: PossibleInjury[]
+  checkedAt: string | null
+}
+
 /** One injury event (AI-detected fall or staff-logged event). */
 export interface InjuryEvent {
   id: number
@@ -45,6 +66,7 @@ export interface InjuryEvent {
   timestamp: string
   videoTimeSec: number | null
   gemini: GeminiInfo
+  aiInjury: AiInjury | null
 }
 
 export interface Player {

@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 from sqlalchemy.sql import func
 
 from database import get_db, SessionLocal, Base
@@ -474,6 +474,38 @@ def get_current_user(authorization: str = Header(...), db: Session = Depends(get
 
 
 # ============================================
+# GEMINI INJURY CHECK RESULTS (src/gemini_injury.py)
+# Possible injuries + rest time per event, kept in output/ai_injury.json
+# (no database change). Read again only when the file changes.
+# ============================================
+
+import json as _json
+
+AI_INJURY_FILE = os.path.join(PROJECT_ROOT, "output", "ai_injury.json")
+_ai_injury_cache = {"mtime": None, "data": {}}
+
+
+def _ai_injury_all():
+    try:
+        st = os.stat(AI_INJURY_FILE)
+        mtime = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _ai_injury_cache["mtime"] != mtime:
+        try:
+            with open(AI_INJURY_FILE, "r", encoding="utf-8") as f:
+                _ai_injury_cache["data"] = _json.load(f)
+        except (OSError, ValueError):
+            _ai_injury_cache["data"] = {}
+        _ai_injury_cache["mtime"] = mtime
+    return _ai_injury_cache["data"]
+
+
+def _ai_injury_for(event_id):
+    return _ai_injury_all().get(str(event_id))
+
+
+# ============================================
 # SERIALIZER
 # ============================================
 
@@ -500,6 +532,7 @@ def event_to_dict(e: InjuryEvent):
         "gemini_team": e.gemini_team,
         "gemini_jersey_confidence": e.gemini_jersey_confidence,
         "gemini_checked_at": e.gemini_checked_at,
+        "ai_injury": _ai_injury_for(e.id),
         "match_session_id": e.match_session_id,
         "match_name": (e.match.name if e.match is not None and e.match.name else
                        ("Match #" + str(e.match_session_id) if e.match_session_id else None)),
@@ -538,7 +571,8 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         "access_token": token,
         "role": user.role,
         "team_id": user.team_id,
-        "username": user.username
+        "username": user.username,
+        "player_id": _player_id_of(user),
     }
 
 
@@ -741,6 +775,7 @@ def gemini_result(
     request: GeminiResultRequest,
     keep_false_alarm: bool = Query(False),
     min_jersey_confidence: Optional[float] = Query(None),
+    jersey_only: bool = Query(False),
     db: Session = Depends(get_db)
 ):
 
@@ -753,8 +788,8 @@ def gemini_result(
     confidence = request.confidence if request.confidence is not None else 0.0
     jersey_min = max(GEMINI_JERSEY_MIN_CONFIDENCE, min_jersey_confidence or 0.0)
 
-    # 1) confident false alarm -> delete
-    if (verdict == "false_alarm" and confidence >= GEMINI_DELETE_MIN_CONFIDENCE
+    # 1) confident false alarm -> delete (never in jersey-only mode: the injury check decides that)
+    if (not jersey_only and verdict == "false_alarm" and confidence >= GEMINI_DELETE_MIN_CONFIDENCE
             and event.identified_by != "manual" and not keep_false_alarm):
 
         clip_path = event.clip_path
@@ -768,11 +803,12 @@ def gemini_result(
 
         return {"action": "deleted", "event_id": event_id, "reason": request.reason}
 
-    # 2) store the second opinion
-    event.gemini_verdict = verdict
-    event.gemini_confidence = request.confidence
-    event.gemini_reason = request.reason
-    event.gemini_description = request.description
+    # 2) store the second opinion (jersey-only: just the shirt read, no fall verdict)
+    if not jersey_only:
+        event.gemini_verdict = verdict
+        event.gemini_confidence = request.confidence
+        event.gemini_reason = request.reason
+        event.gemini_description = request.description
     event.gemini_team = request.team
     event.gemini_jersey = request.jersey_number
     event.gemini_jersey_confidence = request.jersey_confidence
@@ -824,6 +860,86 @@ def gemini_result(
     db.refresh(event)
 
     return {"action": action, "event": event_to_dict(event)}
+
+
+# ============================================
+# EVENTS — GEMINI INJURY CHECK (sent by src/gemini_injury.py)
+# Stores the possible injuries (names, risk, safety measure and rest time come from
+# src/injury_catalog.py) in output/ai_injury.json. Removing a fall that was not an
+# injury goes through PATCH /events/{id}/gemini like the other false alarms.
+# ============================================
+
+AI_INJURY_RISKS = ("Low", "Low-Medium", "Medium", "Medium-High", "High", "Critical")
+
+
+class AiInjuryItem(BaseModel):
+    injury: str
+    body_area: str
+    risk: str
+    safety_measure: str
+    rest: str
+    likelihood: Optional[float] = None
+
+
+class AiInjuryRequest(BaseModel):
+    injury_event: bool = True
+    confidence: Optional[float] = None
+    action: Optional[str] = None
+    description: Optional[str] = None
+    side: Optional[str] = None
+    injuries: list[AiInjuryItem] = []
+    rest: Optional[str] = None
+    risk: Optional[str] = None
+    model: Optional[str] = None
+
+
+def _clip_text(v, n):
+    v = str(v or "").strip()
+    return v[:n] or None
+
+
+@app.patch("/events/{event_id}/ai-injury")
+def ai_injury_result(event_id: int, request: AiInjuryRequest, db: Session = Depends(get_db)):
+
+    event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
+
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    injuries = []
+    for i in request.injuries[:5]:
+        injuries.append({
+            "injury": _clip_text(i.injury, 80),
+            "body_area": _clip_text(i.body_area, 40),
+            "risk": i.risk if i.risk in AI_INJURY_RISKS else None,
+            "safety_measure": _clip_text(i.safety_measure, 160),
+            "rest": _clip_text(i.rest, 40),
+            "likelihood": max(0.0, min(1.0, i.likelihood)) if i.likelihood is not None else None,
+        })
+
+    if not injuries:
+        raise HTTPException(status_code=400, detail="At least one possible injury is required")
+
+    record = {
+        "injury_event": bool(request.injury_event),
+        "confidence": request.confidence,
+        "action": _clip_text(request.action, 120),
+        "description": _clip_text(request.description, 300),
+        "side": request.side if request.side in ("left", "right") else None,
+        "injuries": injuries,
+        "rest": _clip_text(request.rest, 40) or injuries[0]["rest"],
+        "risk": request.risk if request.risk in AI_INJURY_RISKS else None,
+        "model": _clip_text(request.model, 60),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    data = dict(_load_json(AI_INJURY_FILE, {}))
+    data[str(event_id)] = record
+    _save_json(AI_INJURY_FILE, data)
+
+    print("[INJURY-AI] event", event_id, "->", ", ".join(i["injury"] for i in injuries), "| rest", record["rest"])
+
+    return {"action": "stored", "event": event_to_dict(event)}
 
 
 # ============================================
@@ -947,6 +1063,10 @@ def get_events(
             )
         )
 
+    elif current_user.role == "player":
+        # a player only sees their own falls
+        query = query.filter(InjuryEvent.player_id == (_player_id_of(current_user) or -1))
+
     else:
         raise HTTPException(status_code=403, detail="Unknown role")
 
@@ -956,9 +1076,7 @@ def get_events(
     events = query.order_by(InjuryEvent.timestamp.desc()).all()
 
     return [event_to_dict(e) for e in events]
-
-
-# ============================================
+    # ============================================
 # GET PLAYERS — all players, both teams, for every role
 # ============================================
 
@@ -968,11 +1086,13 @@ def get_events(
 @app.get("/players")
 def get_players(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    players = (
-        db.query(Player)
-        .order_by(Player.team_id, Player.jersey_number)
-        .all()
-    )
+    query = db.query(Player)
+
+    # a player only gets their own record
+    if current_user.role == "player":
+        query = query.filter(Player.id == (_player_id_of(current_user) or -1))
+
+    players = query.order_by(Player.team_id, Player.jersey_number).all()
 
     return [
         {
@@ -996,7 +1116,7 @@ def get_teams(current_user: User = Depends(get_current_user), db: Session = Depe
     if current_user.role in ("medical", "admin"):
         teams = db.query(Team).order_by(Team.id).all()
 
-    elif current_user.role == "coach":
+    elif current_user.role in ("coach", "player"):
         teams = db.query(Team).filter(Team.id == current_user.team_id).all()
 
     else:
@@ -1062,6 +1182,9 @@ def get_teams(current_user: User = Depends(get_current_user), db: Session = Depe
 @app.patch("/events/{event_id}/resolve")
 def resolve_event(event_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
+    if current_user.role == "player":
+        raise HTTPException(status_code=403, detail="Players cannot change the review state")
+
     event = db.query(InjuryEvent).filter(InjuryEvent.id == event_id).first()
 
     if event is None:
@@ -1122,7 +1245,27 @@ def clear_all_injury_events(current_user: User = Depends(get_current_user), db: 
 # Passwords are stored hashed, exactly the way /auth/login checks them.
 # ============================================
 
-USER_ROLES = ("admin", "medical", "coach")
+USER_ROLES = ("admin", "medical", "coach", "player")
+
+# Player logins: which roster player each "player" account belongs to.
+# Kept in output/player_accounts.json ({"<user id>": <player id>}), so the database is not changed.
+PLAYER_ACCOUNTS_FILE = os.path.join(PROJECT_ROOT, "output", "player_accounts.json")
+
+
+def _player_accounts():
+    data = _load_json(PLAYER_ACCOUNTS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _player_id_of(user):
+    """Roster player id of a player login, else None."""
+    if user is None or user.role != "player":
+        return None
+    try:
+        value = _player_accounts().get(str(user.id))
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 MIN_PASSWORD_LENGTH = 6
 MAX_PASSWORD_LENGTH = 72      # bcrypt only uses the first 72 bytes
 
@@ -1130,19 +1273,37 @@ MAX_PASSWORD_LENGTH = 72      # bcrypt only uses the first 72 bytes
 class UserCreateRequest(BaseModel):
     username: str
     password: str
-    role: str                         # admin / medical / coach
+    role: str                         # admin / medical / coach / player
     team_id: Optional[int] = None     # required for coach, ignored otherwise
+    player_id: Optional[int] = None   # required for player: the roster player this login belongs to
 
 
 def user_to_dict(u: User):
 
-    return {
+    out = {
         "id": u.id,
         "username": u.username,
         "role": u.role,
         "team_id": u.team_id,
         "team_name": u.team.name if u.team is not None else None,
+        "player_id": None,
+        "player_name": None,
+        "jersey_number": None,
+        "coaches": [],
     }
+
+    pid = _player_id_of(u)
+    session = object_session(u)
+
+    if pid is not None and session is not None:
+        player = session.query(Player).filter(Player.id == pid).first()
+        if player is not None:
+            out["player_id"] = player.id
+            out["player_name"] = player.name
+            out["jersey_number"] = player.jersey_number
+            out["coaches"] = [c.username for c in session.query(User).filter(User.role == "coach", User.team_id == player.team_id).all()]
+
+    return out
 
 
 def _require_admin(current_user: User):
@@ -1190,7 +1351,7 @@ def create_user(
         raise HTTPException(status_code=400, detail="Password must be " + str(MAX_PASSWORD_LENGTH) + " characters or fewer")
 
     if role not in USER_ROLES:
-        raise HTTPException(status_code=400, detail="Role must be admin, medical or coach")
+        raise HTTPException(status_code=400, detail="Role must be admin, medical, coach or player")
 
     taken = db.query(User).filter(func.lower(User.username) == username.lower()).first()
 
@@ -1211,6 +1372,25 @@ def create_user(
 
         team_id = team.id
 
+    player = None
+
+    if role == "player":
+
+        if request.player_id is None:
+            raise HTTPException(status_code=400, detail="Pick the player this login belongs to")
+
+        player = db.query(Player).filter(Player.id == request.player_id).first()
+
+        if player is None:
+            raise HTTPException(status_code=404, detail="Player not found")
+
+        accounts = _player_accounts()
+        existing_ids = [int(k) for k, v in accounts.items() if str(k).isdigit() and v == player.id]
+        if existing_ids and db.query(User).filter(User.id.in_(existing_ids)).first() is not None:
+            raise HTTPException(status_code=409, detail=player.name + " already has a player login")
+
+        team_id = player.team_id
+
     user = User(
         username=username,
         password_hash=pwd_context.hash(password),
@@ -1221,6 +1401,11 @@ def create_user(
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    if player is not None:
+        accounts = _player_accounts()
+        accounts[str(user.id)] = player.id
+        _save_json(PLAYER_ACCOUNTS_FILE, accounts)
 
     print("[USERS]", current_user.username, "created", username, "(" + role + ")")
 
@@ -1247,6 +1432,11 @@ def delete_user(user_id: int, current_user: User = Depends(get_current_user), db
 
     db.delete(user)
     db.commit()
+
+    accounts = _player_accounts()
+    if str(user_id) in accounts:
+        accounts.pop(str(user_id), None)
+        _save_json(PLAYER_ACCOUNTS_FILE, accounts)
 
     print("[USERS]", current_user.username, "deleted", username)
 
@@ -1503,6 +1693,9 @@ def _can_see_event(user: User, event: InjuryEvent):
         return True
     if user.role == "coach":
         return event.player is None or event.player.team_id == user.team_id
+    if user.role == "player":
+        pid = _player_id_of(user)
+        return pid is not None and event.player_id == pid
     return False
 
 
@@ -1903,6 +2096,8 @@ class InjuryHistoryRequest(BaseModel):
 def _history_can_view(user: User, player: Player):
     if user.role in ("medical", "admin"):
         return True
+    if user.role == "player":
+        return player.id == _player_id_of(user)
     return user.role == "coach" and player.team_id == user.team_id
 
 

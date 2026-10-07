@@ -6,6 +6,7 @@ import { ToastProvider } from './ui'
 import Layout from './Layout'
 import type { Role } from './types'
 import * as P from './pages'
+import * as PL from './playerPages'
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } })
 const G = ({ roles, children }: { roles: Role[]; children: ReactNode }) => {
@@ -39,7 +40,13 @@ export default function App() {
                 <Route path="/matches/:id" element={<G roles={ALL}><P.MatchDetail /></G>} />
                 <Route path="/matches/:id/monitor" element={<G roles={ALL}><P.Monitor /></G>} />
                 <Route path="/events" element={<G roles={ALL}><P.ListPage k="events" /></G>} />
-                <Route path="/events/:id" element={<G roles={ALL}><P.EventDetail /></G>} />
+                <Route path="/events/:id" element={<G roles={[...ALL, 'PLAYER']}><P.EventDetail /></G>} />
+                {/* Player logins: their own dashboard, profile, injury history, current injury events and report */}
+                <Route path="/player/dashboard" element={<G roles={['PLAYER']}><PL.PlayerDashboard /></G>} />
+                <Route path="/player/profile" element={<G roles={['PLAYER']}><PL.PlayerProfile /></G>} />
+                <Route path="/player/history" element={<G roles={['PLAYER']}><PL.PlayerHistoryPage /></G>} />
+                <Route path="/player/events" element={<G roles={['PLAYER']}><PL.PlayerEvents /></G>} />
+                <Route path="/player/reports" element={<G roles={['PLAYER']}><PL.PlayerReports /></G>} />
                 <Route path="/events/:id/assessment" element={<G roles={['MEDICAL']}><P.Assessment /></G>} />
                 <Route path="/collisions" element={<G roles={ALL}><P.ListPage k="collisions" /></G>} />
                 <Route path="/collisions/:id" element={<G roles={ALL}><P.EventDetail collision /></G>} />

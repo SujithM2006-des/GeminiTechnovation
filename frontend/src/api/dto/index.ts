@@ -2,9 +2,10 @@
 
 export interface LoginDto {
   access_token: string
-  role: string // "admin" | "medical" | "coach"
+  role: string // "admin" | "medical" | "coach" | "player"
   team_id: number | null
   username: string
+  player_id?: number | null
 }
 
 export interface EventDto {
@@ -27,6 +28,7 @@ export interface EventDto {
   gemini_jersey: number | null
   gemini_team: string | null
   gemini_jersey_confidence: number | null
+  ai_injury?: AiInjuryDto | null
   match_session_id: number | null
   match_name: string | null
   event_type: string
@@ -39,6 +41,29 @@ export interface EventDto {
   source: string
   resolved: boolean
   timestamp: string
+}
+
+/** Gemini injury check (src/gemini_injury.py): possible injuries from the injury catalog with rest time */
+export interface AiInjuryItemDto {
+  injury: string
+  body_area: string
+  risk: string | null
+  safety_measure: string | null
+  rest: string | null
+  likelihood: number | null
+}
+
+export interface AiInjuryDto {
+  injury_event: boolean
+  confidence: number | null
+  action: string | null
+  description: string | null
+  side: string | null
+  injuries: AiInjuryItemDto[]
+  rest: string | null
+  risk: string | null
+  model: string | null
+  checked_at: string | null
 }
 
 export interface PlayerDto {
@@ -69,9 +94,13 @@ export interface MatchDto {
 export interface UserDto {
   id: number
   username: string
-  role: string // "admin" | "medical" | "coach"
+  role: string // "admin" | "medical" | "coach" | "player"
   team_id: number | null
   team_name: string | null
+  player_id?: number | null      // player logins: the roster player
+  player_name?: string | null
+  jersey_number?: number | null
+  coaches?: string[]
 }
 
 /** GET /admin/system — live checks plus the detector's last report. */

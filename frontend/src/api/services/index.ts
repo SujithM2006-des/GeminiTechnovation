@@ -48,9 +48,9 @@ export async function getUsers(): Promise<AppUser[]> {
   return (await api.get<UserDto[]>(EP.users)).data.map(toUser)
 }
 
-/** Admin only. Username is plain text (e.g. "coach3"); a coach needs a team. */
-export async function createUser(v: { username: string; password: string; role: Role; teamId: number | null }): Promise<AppUser> {
-  const r = await api.post<{ user: UserDto }>(EP.users, { username: v.username, password: v.password, role: v.role.toLowerCase(), team_id: v.role === 'COACH' ? v.teamId : null })
+/** Admin only. Username is plain text (e.g. "coach3"); a coach needs a team, a player login needs its roster player. */
+export async function createUser(v: { username: string; password: string; role: Role; teamId: number | null; playerId?: number | null }): Promise<AppUser> {
+  const r = await api.post<{ user: UserDto }>(EP.users, { username: v.username, password: v.password, role: v.role.toLowerCase(), team_id: v.role === 'COACH' ? v.teamId : null, player_id: v.role === 'PLAYER' ? v.playerId ?? null : null })
   return toUser(r.data.user)
 }
 
