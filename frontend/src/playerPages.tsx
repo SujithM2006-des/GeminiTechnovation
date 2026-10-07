@@ -15,7 +15,7 @@ import { useAssessments, useEvents, useInjuryHistory } from './queries'
 import type { InjuryEvent } from './types'
 import type { AssessmentDto } from './api/dto'
 import { Badge, Card, EmptyState, ErrorState, Na, PageHeader, RiskBadge, SafetyMeasures, Skeleton, btnS } from './ui'
-import { EventLine, PossibleInjuries, PreviousInjuries, ReportsPage, ROLE_ACCESS, STATUS_TONE, btnSm, fmtDate, fmtVideo } from './pages'
+import { EventLine, PossibleInjuries, PreviousInjuries, ReportsPage, ROLE_ACCESS, STATUS_TONE, btnSm, fmtDate, fmtVideo, kpiLabel } from './pages'
 
 /** The logged-in player's account (name, jersey, team, coach). */
 const useMe = () => {
@@ -100,7 +100,7 @@ export function PlayerDashboard() {
     <>
       <PageHeader back={false} title="Player dashboard" crumbs={[{ label: 'Dashboard' }]} actions={<Link to="/player/reports" className={btnS}><FileText size={16} />My report</Link>} />
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        {KPI.map(([k, v, t]) => <Card key={k}><p className="text-xs text-slate-500">{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-2xl' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
+        {KPI.map(([k, v, t]) => <Card key={k}><p className={kpiLabel}>{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-2xl' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
       </div>
       <p className="mt-2 text-xs text-slate-500">{dev ? 'Metrics are shown only when real backend data is available.' : `Welcome, ${name}. You see only your own injury data.`}</p>
 

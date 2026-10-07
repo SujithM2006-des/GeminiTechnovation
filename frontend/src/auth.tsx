@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import type { Role } from './types'
 import { login as loginSvc } from './api/services'
 import { devMode, setUnauthorizedHandler, tokenStore } from './api/client'
@@ -25,19 +26,24 @@ function savedUser(): User | null {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(savedUser)
+  const qc = useQueryClient()
 
+  // Drop everything loaded for the previous account, so a new login never sees its cached lists
+  // (e.g. a player's own one-player list showing as "Total players: 1" on the admin dashboard).
   const logout = useCallback(() => {
+    qc.clear()
     tokenStore.clear()
     localStorage.removeItem(USER_KEY)
     devMode.set(false)
     setUser(null)
-  }, [])
+  }, [qc])
 
   // Session expired -> log out (Layout then redirects to /login)
   useEffect(() => { setUnauthorizedHandler(logout) }, [logout])
 
   const login = async (u: string, p: string) => {
     const r = await loginSvc(u, p)
+    qc.clear()
     tokenStore.set(r.access_token)
     devMode.set(false)
     const next: User = { name: r.username, role: toRole(r.role), teamId: r.team_id }
@@ -48,6 +54,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   /** Look at each role's screens without logging in (no data is loaded). */
   const devPreview = (role: Role) => {
+    qc.clear()
     tokenStore.clear()
     localStorage.removeItem(USER_KEY)
     devMode.set(true)

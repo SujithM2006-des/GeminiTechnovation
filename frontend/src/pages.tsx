@@ -591,6 +591,8 @@ const QA: Record<Role, [string, string][]> = {
   MEDICAL: [['Review queue', '/events'], ['Collisions', '/collisions'], ['Reports', '/reports']],
   PLAYER: [],
 }
+/** Label on top of each dashboard KPI card (same on every dashboard) */
+export const kpiLabel = 'text-sm font-semibold text-blue-700'
 /** KPI cards fill the full width whatever their count (Tailwind needs the full class names written out) */
 const KPI_COLS: Record<number, string> = { 4: 'lg:grid-cols-4', 5: 'lg:grid-cols-5', 6: 'lg:grid-cols-3 xl:grid-cols-6' }
 const byRisk = (a: InjuryEvent, b: InjuryEvent) => ['HIGH', 'MEDIUM', 'LOW'].indexOf(a.risk ?? 'LOW') - ['HIGH', 'MEDIUM', 'LOW'].indexOf(b.risk ?? 'LOW')
@@ -642,7 +644,7 @@ export function Dashboard({ role }: { role: Role }) {
           {role === 'MEDICAL' && <button className={btnP} disabled={dev} onClick={() => setLogOpen(true)}><ClipboardPlus size={16} />Log manual event</button>}
         </>} />
       <div className={`grid grid-cols-2 gap-3 ${KPI_COLS[KPI[role].length] ?? 'lg:grid-cols-3 xl:grid-cols-6'}`}>
-        {KPI[role].map(([k, v, t]) => <Card key={k}><p className="text-xs text-slate-500">{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-lg' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
+        {KPI[role].map(([k, v, t]) => <Card key={k}><p className={kpiLabel}>{k}</p>{ev.isLoading ? <Skeleton className="mt-2 h-8 w-12" /> : <p className={`mt-1 truncate font-bold ${typeof v === 'string' ? 'text-lg' : 'text-3xl'} ${t ?? ''}`} title={typeof v === 'string' ? v : undefined}><Na v={v} /></p>}</Card>)}
       </div>
       {dev && <p className="mt-2 text-xs text-slate-500">Metrics are shown only when real backend data is available.</p>}
       {role === 'COACH' && !dev && <p className="mt-2 text-xs text-slate-500">You see your team's events and every unidentified fall.</p>}
