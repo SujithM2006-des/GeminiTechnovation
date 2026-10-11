@@ -23,6 +23,14 @@ from player_identifier import PlayerIdentifier
 import gemini_verifier
 import system_status
 
+# Gemini injury check (optional add-on). If the file is missing or fails to load,
+# detection carries on exactly as before.
+try:
+    import gemini_injury
+except Exception as _e:
+    gemini_injury = None
+    print("[INJURY-AI] gemini_injury.py not loaded - injury check off:", _e)
+
 # START
 
 print("====================================")
@@ -126,6 +134,12 @@ REQUIRE_LEGS_FOR_FALL = True     # knees or ankles must be visible to judge a fa
 # and a surer jersey read from Gemini replaces our player.
 GEMINI_CHECK = True
 
+# ---- Gemini injury check (own key: GEMINI_INJURY_API_KEY, see gemini_injury.py) ----
+# OFF unless .env has GEMINI_INJURY_CHECK=1, so normal runs are unchanged.
+# When ON: sliding tackles, keeper dives, celebrations etc. are removed; real falls get
+# the possible injuries + rest time from injury_catalog.py (shown on the dashboard).
+GEMINI_INJURY_CHECK = gemini_injury is not None and os.getenv("GEMINI_INJURY_CHECK", "0").strip() == "1"
+
 
 def open_video_source():
     source = SOURCE_CONFIG[SOURCE_MODE]
@@ -190,6 +204,9 @@ start_notifications()
 if GEMINI_CHECK:
     gemini_verifier.start()
 
+if GEMINI_INJURY_CHECK:
+    gemini_injury.start()
+
 # SYSTEM STATUS — tells the dashboard's System page what this run is using
 # (runs in the background; never slows down or stops detection)
 try:
@@ -219,6 +236,7 @@ try:
         "face_engines": system_status.loaded_libraries(system_status._FACE_LIBRARIES),
         "gemini_enabled": bool(GEMINI_CHECK),
         "gemini_available": bool(GEMINI_CHECK and gemini_verifier.is_available()),
+        "gemini_injury_available": bool(GEMINI_INJURY_CHECK and gemini_injury.is_available()),
         "collision_alerts": ENABLE_COLLISION_ALERTS,
     }
     _status_info.update(system_status.tracker_details(TRACKER_CONFIG))
@@ -506,7 +524,6 @@ def compute_static_posture(points, conf, box_width, box_height):
     is_horizontal = angle_horizontal and ratio_horizontal
     return is_horizontal, torso_angle
 
-
 # SINGLE-FRAME REGION ESTIMATE (grouped)
 # Picks the region that has dropped furthest below its normal standing position.
 def estimate_posture_region(points, conf, box_top, box_height):
@@ -760,6 +777,9 @@ def write_clip(clip):
     # Gemini second opinion on the raw frames (runs in the background)
     if GEMINI_CHECK and clip.get("target_box") is not None and clip.get("raw_frames"):
         gemini_verifier.submit(ids, clip["raw_frames"], clip["target_index"], clip["target_box"], clip["context"])
+    # Gemini injury check: real injury or normal play? possible injuries + rest (background)
+    if GEMINI_INJURY_CHECK and clip.get("target_box") is not None and clip.get("raw_frames"):
+        gemini_injury.submit(ids, clip["raw_frames"], clip["target_index"], clip["target_box"], clip["context"])
 
 
 def update_clips(small_frame, raw_small_frame):
@@ -1075,6 +1095,7 @@ def record_event(track_id, event_type, region, movement, risk, log_name, frame=N
         context={
             "video_time": "%d:%02d:%02d" % (vt // 3600, (vt % 3600) // 60, vt % 60),
             "player": player_name,
+            "region": region,
         },
     )
     event_log.append({
@@ -1535,6 +1556,8 @@ if identifier is not None:
 # Gemini must finish before WhatsApp closes (it may send corrections)
 if GEMINI_CHECK:
     gemini_verifier.shutdown()
+if GEMINI_INJURY_CHECK:
+    gemini_injury.shutdown()
 
 finish_notifications()
 
@@ -1549,6 +1572,8 @@ for e in event_log:
         e["player"] = gemini_verifier.player_changes[e["event_id"]]
         e["identified_by"] = "gemini"
 event_log[:] = [e for e in event_log if e["event_id"] not in gemini_verifier.deleted_event_ids]
+if GEMINI_INJURY_CHECK:
+    event_log[:] = [e for e in event_log if e["event_id"] not in gemini_injury.deleted_event_ids]
 
 falls_saved = [e for e in event_log if e["event"].startswith("FALL")]
 falls_identified = [e for e in falls_saved if e["player"] != "Unidentified"]
@@ -1580,6 +1605,10 @@ if GEMINI_CHECK and gemini_verifier.is_available():
     print(" Gemini: checked", gs["checked"], "| false alarms deleted", gs["false_alarm_deleted"],
           "| players re-assigned", gs["reassigned"], "| newly identified", gs["identified"],
           "| errors", gs["errors"])
+if GEMINI_INJURY_CHECK and gemini_injury.is_available():
+    gi = gemini_injury.stats
+    print(" Injury check: checked", gi["checked"], "| not an injury (removed)", gi["not_injury_deleted"],
+          "| possible injuries found", gi["injuries_found"], "| errors", gi["errors"])
 print("====================================")
 
 print()

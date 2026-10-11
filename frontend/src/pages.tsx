@@ -756,7 +756,7 @@ function ListPageInner({ k }: { k: string }) {
   const canCreate = !!c.create && user?.role === 'ADMIN'
   const matches = useMatches().data ?? []
   const players = usePlayers().data ?? []
-  const optsFor = (name: string, opts: string[]) => (name === 'Match' ? matches.map((m) => m.name) : name === 'Team' ? [...new Set(players.map((p) => p.teamName).filter(Boolean))] as string[] : opts)
+  const optsFor = (name: string, opts: string[]) => (name === 'Match' ? [...new Set(matches.map((m) => m.name))] : name === 'Team' ? [...new Set(players.map((p) => p.teamName).filter(Boolean))] as string[] : opts)
   // Position isn't recorded by the backend
   const disabledFilter = (name: string) => (k === 'players' && name === 'Position') || k === 'reports' || k === 'users' || (k === 'teams' && name === 'Status') || (k === 'matches' && name === 'Status')
   const anyFilter = q || c.filters.some((x) => fv(x.name)) || sp.get('identity')
