@@ -43,7 +43,35 @@ PREFILL_TIMEOUT = 15     # seconds to wait for URL-prefilled text (fallback mode
 START_ATTEMPTS = 3       # how many times to try launching Chrome
 SEND_ATTEMPTS = 2        # attempt 1 = in-page (no reload), attempt 2 = URL fallback
 
-_BOX_SELECTOR = "footer div[contenteditable='true']"
+# WhatsApp Web changes its page now and then, so several known selectors are tried.
+# Message box of the open chat (never the search box on the left)
+_BOX_SELECTOR = ", ".join([
+    "footer div[contenteditable='true']",
+    "#main div[contenteditable='true'][role='textbox']",
+    "#main div[contenteditable='true'][data-tab='10']",
+    "div[contenteditable='true'][aria-placeholder='Type a message']",
+])
+
+# Anything that only exists once WhatsApp Web is logged in (chat list / side pane)
+_LOGGED_IN_SELECTORS = [
+    "#pane-side",
+    "div[aria-label='Chat list']",
+    "div[aria-label='Chats']",
+    "div[role='grid'][aria-label]",
+    "span[data-icon='new-chat-outline']",
+    "span[data-icon='chat-filled-refreshed']",
+    "div[contenteditable='true'][data-tab='3']",
+]
+
+# Send button (newer and older WhatsApp Web versions)
+_SEND_BUTTON_SELECTOR = ", ".join([
+    "button[aria-label='Send']",
+    "div[aria-label='Send'][role='button']",
+    "span[data-icon='send']",
+    "span[data-icon='wds-ic-send-filled']",
+])
+
+DEBUG_SCREENSHOT = os.path.join(PROJECT_ROOT, "output", "whatsapp_debug.png")
 _TEXT_JS = "return (arguments[0].innerText || '').trim();"
 
 # opens the chat inside the already-loaded page (no reload)
@@ -204,14 +232,28 @@ def _wait_for_login(driver):
     _log("[WHATSAPP] Opening WhatsApp Web... scan the QR code in Chrome if asked.")
 
     def logged_in(d):
-        return (
-            len(d.find_elements(By.ID, "pane-side")) > 0
-            or len(d.find_elements(By.CSS_SELECTOR, "div[aria-label='Chat list']")) > 0
+        return any(len(d.find_elements(By.CSS_SELECTOR, sel)) > 0 for sel in _LOGGED_IN_SELECTORS)
+
+    try:
+        WebDriverWait(driver, LOGIN_TIMEOUT).until(logged_in)
+    except Exception:
+        _save_debug(driver)
+        raise RuntimeError(
+            "WhatsApp Web did not finish logging in within " + str(LOGIN_TIMEOUT) + "s "
+            "(QR code not scanned, or the page layout changed - see output\\whatsapp_debug.png)"
         )
 
-    WebDriverWait(driver, LOGIN_TIMEOUT).until(logged_in)
-
     _log("[WHATSAPP] Logged in and ready.")
+
+
+def _save_debug(driver):
+    """Screenshot of what Chrome shows, so a failure can be diagnosed."""
+
+    try:
+        driver.save_screenshot(DEBUG_SCREENSHOT)
+        _log("[WHATSAPP] Saved a screenshot of the WhatsApp window to", DEBUG_SCREENSHOT)
+    except Exception:
+        pass
 
 
 def _dismiss_alert(driver):
@@ -308,6 +350,7 @@ def _open_inpage(driver):
         box = _find_box(driver, INPAGE_OPEN_TIMEOUT)
     except Exception:
         _check_invalid_number(driver)
+        _save_debug(driver)
         raise RuntimeError("chat did not open in-page")
 
     time.sleep(1)
@@ -326,6 +369,7 @@ def _open_by_url(driver, text):
         box = _find_box(driver, CHAT_LOAD_TIMEOUT)
     except Exception:
         _check_invalid_number(driver)
+        _save_debug(driver)
         raise RuntimeError("chat box did not appear within " + str(CHAT_LOAD_TIMEOUT) + "s")
 
     # wait until the prefilled text stops changing
@@ -398,9 +442,7 @@ def _send(driver, text, use_url):
 
         if not emptied:
             try:
-                driver.find_element(
-                    By.CSS_SELECTOR, "button[aria-label='Send'], span[data-icon='send']"
-                ).click()
+                driver.find_element(By.CSS_SELECTOR, _SEND_BUTTON_SELECTOR).click()
             except Exception:
                 pass
 
@@ -564,3 +606,16 @@ def build_alert_message(player_name, jersey_number, event_type, region, risk,
     lines.append("Time: " + when_text)
 
     return "\n".join(lines)
+
+# ============================================
+# QUICK TEST (no detector needed):
+#   cd src
+#   python whatsapp_notifier.py
+# ============================================
+
+if __name__ == "__main__":
+    _log("[WHATSAPP] Test: sending one message to", TARGET_PHONE)
+    send_message("AthleteGuard test message - WhatsApp alerts are working.")
+    time.sleep(2)
+    shutdown(timeout=LOGIN_TIMEOUT + CHAT_LOAD_TIMEOUT + 60)
+    _log("[WHATSAPP] Test finished.")
